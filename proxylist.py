@@ -17,18 +17,25 @@ st.title("ClickUp Data Extractor")
 st.caption("Fund Solution Workspace → ACTIVE Proxy Efforts (integrated fuzzy label parsing)")
 
 # -----------------------------
-# Secrets / Config
+# Secrets / Config  (supports both styles)
 # -----------------------------
-CLICKUP_TOKEN = st.secrets.get("clickup", {}).get("token") if hasattr(st, "secrets") else os.getenv("CLICKUP_TOKEN")
-DEFAULT_LIST_ID = st.secrets.get("clickup", {}).get("list_id") if hasattr(st, "secrets") else os.getenv("CLICKUP_LIST_ID")
+CLICKUP_TOKEN = (
+    (st.secrets.get("CLICKUP_TOKEN") if hasattr(st, "secrets") else None)
+    or (st.secrets.get("clickup", {}).get("token") if hasattr(st, "secrets") else None)
+    or os.getenv("CLICKUP_TOKEN")
+)
+
+DEFAULT_LIST_ID = (
+    (st.secrets.get("CLICKUP_LIST_ID") if hasattr(st, "secrets") else None)
+    or (st.secrets.get("clickup", {}).get("list_id") if hasattr(st, "secrets") else None)
+    or os.getenv("CLICKUP_LIST_ID")
+)
 
 if not CLICKUP_TOKEN:
-    st.error("Missing ClickUp token. Please add it to Streamlit secrets as [clickup].token or set CLICKUP_TOKEN env var.")
-    st.stop()
-
-list_id = DEFAULT_LIST_ID or st.text_input("ClickUp List ID", value="", help="If not provided in secrets, enter the List ID here.")
-if not list_id:
-    st.info("Provide a List ID to continue.")
+    st.error(
+        "Missing ClickUp token. Set `CLICKUP_TOKEN = \"...\"` in secrets, or under "
+        "[clickup] token = \"...\", or set the CLICKUP_TOKEN environment variable."
+    )
     st.stop()
 
 # -----------------------------
