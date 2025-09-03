@@ -31,10 +31,8 @@ token = st.secrets["CLICKUP_TOKEN"]
 def auth_headers(tok: str) -> Dict[str, str]:
     return {"Authorization": tok, "Content-Type": "application/json"}
 
-
 def backoff_sleep(attempt: int) -> None:
     time.sleep(min(10, 2 ** attempt))
-
 
 def get_json(url: str, headers: Dict[str, str], params: Dict[str, Any] = None) -> Dict[str, Any]:
     attempt = 0
@@ -47,23 +45,18 @@ def get_json(url: str, headers: Dict[str, str], params: Dict[str, Any] = None) -
         resp.raise_for_status()
         return resp.json()
 
-
 # ---------- ClickUp discovery ----------
 def get_workspaces(token: str) -> List[Dict[str, Any]]:
     return get_json(f"{API_BASE}/team", auth_headers(token)).get("teams", [])
 
-
 def get_spaces(team_id: str, token: str) -> List[Dict[str, Any]]:
     return get_json(f"{API_BASE}/team/{team_id}/space", auth_headers(token)).get("spaces", [])
-
 
 def get_space_folders(space_id: str, token: str) -> List[Dict[str, Any]]:
     return get_json(f"{API_BASE}/space/{space_id}/folder", auth_headers(token)).get("folders", [])
 
-
 def get_lists_in_folder(folder_id: str, token: str) -> List[Dict[str, Any]]:
     return get_json(f"{API_BASE}/folder/{folder_id}/list", auth_headers(token)).get("lists", [])
-
 
 # ---------- Task fetch ----------
 def fetch_list_tasks(
@@ -90,7 +83,6 @@ def fetch_list_tasks(
         page += 1
     return tasks
 
-
 # ---------- Parsing helpers ----------
 # Folder title → Job numbers + Job name
 base_re = re.compile(r"^\s*(\d{6})(.*)$")
@@ -98,7 +90,6 @@ dash_suffix_re = re.compile(r"-\s*(\d{3})")
 comma_full_re = re.compile(r",\s*(\d{6})")
 name_after_paren_re = re.compile(r"\([^)]+\)\s*(.*)$")
 trailing_paren_number_re = re.compile(r"\(\d+\)\s*$")
-
 
 def parse_folder_multi(title: str) -> List[Tuple[str, str]]:
     """Return list of (job_number, job_name) rows based on folder title rules."""
@@ -126,11 +117,9 @@ def parse_folder_multi(title: str) -> List[Tuple[str, str]]:
     job_name = trailing_paren_number_re.sub("", job_name).strip()
     return [(n, job_name) for n in nums]
 
-
 # Codes inside folder contents
 mc_re = re.compile(r"\b(?:MC\d{4}|MCA\d{3})\b", re.IGNORECASE)
 brd_re = re.compile(r"\b([SPZ]\d{5})\b", re.IGNORECASE)
-
 
 def extract_mc_from_text(text: str) -> str:
     """Return the first MC#### or MCA### code in a given text string, or '' if none."""
@@ -139,13 +128,11 @@ def extract_mc_from_text(text: str) -> str:
     m = mc_re.search(text)
     return m.group(0).upper() if m else ""
 
-
 def find_all_brd(text: str) -> List[str]:
     """Return ALL BRD codes (S#####/P#####/Z#####) in order of appearance, uppercased."""
     if not text:
         return []
     return [m.group(1).upper() for m in brd_re.finditer(text)]
-
 
 # ---------- Date label parsing (fuzzy, with fallback) ----------
 # Word-boundary label matchers; we avoid false hits like "RECORD DATE RANGE"
@@ -155,12 +142,11 @@ LABEL_PATTERNS: Dict[str, re.Pattern] = {
 }
 
 # Phrases that mean the label is not a single date value
-BAD_REMAINDER = re.compile(r"^(RANGE|WINDOW|S|UNTIL|THRU|THROUGH)\b", re.IGNORECASE)
-
+# (Removed the buggy `|S|`; added `|TO|`.)
+BAD_REMAINDER = re.compile(r"^(RANGE|WINDOW|UNTIL|THRU|THROUGH|TO)\b", re.IGNORECASE)
 
 def _clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
-
 
 def _parse_iso_from_text(s: str) -> Optional[str]:
     if not s:
@@ -169,11 +155,9 @@ def _parse_iso_from_text(s: str) -> Optional[str]:
         ts = pd.to_datetime(s, errors="coerce")
         if pd.isna(ts):
             return None
-        # Assume naive local; convert to date only
         return ts.date().isoformat()
     except Exception:
         return None
-
 
 def merge_latest_date(current_iso: str, new_ms) -> str:
     """Keep later date (YYYY-MM-DD) given a ClickUp ms timestamp or None."""
@@ -188,7 +172,6 @@ def merge_latest_date(current_iso: str, new_ms) -> str:
         return new_iso
     return max(current_iso, new_iso)
 
-
 def merge_latest_iso(current_iso: str, new_iso: Optional[str]) -> str:
     """Keep the later of two ISO dates (YYYY-MM-DD)."""
     if not new_iso:
@@ -197,11 +180,9 @@ def merge_latest_iso(current_iso: str, new_iso: Optional[str]) -> str:
         return new_iso
     return max(current_iso, new_iso)
 
-
 def label_in_text(label_key: str, text: str) -> bool:
     pat = LABEL_PATTERNS[label_key]
     return bool(pat.search(text or ""))
-
 
 def extract_trailing_after_label(label_key: str, text: str) -> str:
     """If label appears in text (e.g., 'RECORD DATE: APRIL 17, 2025'), return the trailing part."""
@@ -210,11 +191,9 @@ def extract_trailing_after_label(label_key: str, text: str) -> str:
     if not m:
         return ""
     tail = _clean_text(m.group(1))
-    # Guard against RANGE-like remainders
     if BAD_REMAINDER.match(tail):
         return ""
     return tail
-
 
 def parse_any_date_value(v: Any) -> Optional[str]:
     """Parse ClickUp date-like values to ISO. Supports ms epoch ints and strings like 'Apr 17, 2025'."""
@@ -233,9 +212,7 @@ def parse_any_date_value(v: Any) -> Optional[str]:
         return _parse_iso_from_text(v)
     return None
 
-
 # ---------- Scan a folder for codes & dates ----------
-
 def scan_folder_metadata(folder_id: str, token: str) -> dict:
     """
     Single-pass scan of a folder to gather:
@@ -288,16 +265,26 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
                 if due_ms:
                     meta["record_date"] = merge_latest_date(meta["record_date"], due_ms)
                 else:
+                    # 1) Try text after label
                     tail = extract_trailing_after_label("record_date", tname)
-                    meta["record_date"] = merge_latest_iso(meta["record_date"], _parse_iso_from_text(tail))
+                    iso = _parse_iso_from_text(tail)
+                    # 2) Fallback: fuzzy-parse anywhere in the title
+                    if not iso:
+                        iso = _parse_iso_from_text(tname)
+                    meta["record_date"] = merge_latest_iso(meta["record_date"], iso)
 
             # ---- MEETING DATE (same approach) ----
             if label_in_text("meeting_date", tname):
                 if due_ms:
                     meta["meeting_date"] = merge_latest_date(meta["meeting_date"], due_ms)
                 else:
+                    # 1) Try text after label
                     tail = extract_trailing_after_label("meeting_date", tname)
-                    meta["meeting_date"] = merge_latest_iso(meta["meeting_date"], _parse_iso_from_text(tail))
+                    iso = _parse_iso_from_text(tail)
+                    # 2) Fallback: fuzzy-parse anywhere in the title
+                    if not iso:
+                        iso = _parse_iso_from_text(tname)
+                    meta["meeting_date"] = merge_latest_iso(meta["meeting_date"], iso)
 
             # String custom fields for codes; date custom fields by label
             for cf in (t.get("custom_fields") or []):
@@ -316,18 +303,23 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
                     if not iso:
                         tail = extract_trailing_after_label("record_date", cf_name)
                         iso = _parse_iso_from_text(tail)
+                    # Fallback: fuzzy-parse anywhere in the CF name
+                    if not iso:
+                        iso = _parse_iso_from_text(cf_name)
                     meta["record_date"] = merge_latest_iso(meta["record_date"], iso)
                 if label_in_text("meeting_date", cf_name):
                     iso = parse_any_date_value(val)
                     if not iso:
                         tail = extract_trailing_after_label("meeting_date", cf_name)
                         iso = _parse_iso_from_text(tail)
+                    # Fallback: fuzzy-parse anywhere in the CF name
+                    if not iso:
+                        iso = _parse_iso_from_text(cf_name)
                     meta["meeting_date"] = merge_latest_iso(meta["meeting_date"], iso)
 
     # Join all BRD codes into a single cell
     meta["brd_code"] = ", ".join(brd_accum)
     return meta
-
 
 # ---------- Fixed-run button ----------
 if not token:
