@@ -38,6 +38,20 @@ if not CLICKUP_TOKEN:
     )
     st.stop()
 
+# -------- List ID input / default --------
+list_id = (DEFAULT_LIST_ID or os.getenv("CLICKUP_LIST_ID") or "").strip()
+
+# Let the user override or supply it if missing
+list_id = st.text_input(
+    "ClickUp List ID",
+    value=list_id,
+    help="Paste the ClickUp List ID (e.g., 901234567) if not already set in secrets.",
+).strip()
+
+if not list_id:
+    st.info("Provide a List ID to continue.")
+    st.stop()
+
 # -----------------------------
 # HTTP Client
 # -----------------------------
