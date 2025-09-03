@@ -112,11 +112,11 @@ def parse_folder_multi(title: str) -> List[Tuple[str, str]]:
 mc_re = re.compile(r"\b(?:MC\d{4}|MCA\d{3})\b", re.IGNORECASE)
 brd_re = re.compile(r"\b([SPZ]\d{5})\b", re.IGNORECASE)
 
-def extract_mc_from_text(text: str) -> str:
+def find_all_brd(text: str) -> list[str]:
+    """Return ALL BRD codes (S#####/P#####/Z#####) in order of appearance, uppercased."""
     if not text:
-        return ""
-    m = mc_re.search(text)
-    return m.group(0).upper() if m else ""
+        return []
+    return [m.group(1).upper() for m in brd_re.finditer(text)]
 
 def extract_brd_from_text(text: str) -> str:
     if not text:
@@ -144,7 +144,7 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
     """
     Single-pass scan of a folder to gather:
       - mc_code: first MC####/MCA### found (lists -> tasks -> CF strings)
-      - brd_code: first S/P/Z + 5 digits found (lists -> tasks -> CF strings)
+      - brd_code: ALL S/P/Z + 5 digits found (lists -> tasks -> CF strings), joined by ", "
       - record_date: latest due_date from tasks named 'RECORD DATE'
       - meeting_date: latest due_date from tasks named 'MEETING DATE'
     """
@@ -152,51 +152,61 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
 
     lists = get_lists_in_folder(folder_id, token)
 
-    # Fast pass on list names (codes)
+    # Helper: append codes preserving first-seen order (no duplicates)
+    brd_accum: list[str] = []
+    seen = set()
+    def add_brd_codes(codes: list[str]):
+        nonlocal brd_accum, seen
+        for c in codes:
+            if c not in seen:
+                seen.add(c)
+                brd_accum.append(c)
+
+    # Quick pass on list names
     for l in lists:
+        name = l.get("name") or ""
         if not meta["mc_code"]:
-            mc = extract_mc_from_text(l.get("name"))
+            mc = extract_mc_from_text(name)
             if mc:
                 meta["mc_code"] = mc
-        if not meta["brd_code"]:
-            brd = extract_brd_from_text(l.get("name"))
-            if brd:
-                meta["brd_code"] = brd
-        if meta["mc_code"] and meta["brd_code"]:
-            break
+        add_brd_codes(find_all_brd(name))
 
-    # Tasks (codes + dates)
+    # Tasks (names + string CFs) for codes and dates
     for l in lists:
         for t in fetch_list_tasks(token, str(l["id"]), include_closed=True, include_subtasks=True, limit=100):
+            tname = t.get("name") or ""
+
+            # MC first-hit only
             if not meta["mc_code"]:
-                mc = extract_mc_from_text(t.get("name"))
+                mc = extract_mc_from_text(tname)
                 if mc:
                     meta["mc_code"] = mc
-            if not meta["brd_code"]:
-                brd = extract_brd_from_text(t.get("name"))
-                if brd:
-                    meta["brd_code"] = brd
 
-            title_norm = normalize_title(t.get("name", ""))
+            # BRD: collect all occurrences
+            add_brd_codes(find_all_brd(tname))
+
+            # Dates
+            title_norm = normalize_title(tname)
             if title_norm == "RECORD DATE":
                 meta["record_date"] = merge_latest_date(meta["record_date"], t.get("due_date"))
             elif title_norm == "MEETING DATE":
                 meta["meeting_date"] = merge_latest_date(meta["meeting_date"], t.get("due_date"))
 
-            if (not meta["mc_code"]) or (not meta["brd_code"]):
-                for cf in (t.get("custom_fields") or []):
-                    val = cf.get("value")
-                    if isinstance(val, str):
-                        if not meta["mc_code"]:
-                            mc = extract_mc_from_text(val)
-                            if mc:
-                                meta["mc_code"] = mc
-                        if not meta["brd_code"]:
-                            brd = extract_brd_from_text(val)
-                            if brd:
-                                meta["brd_code"] = brd
+            # String custom fields
+            for cf in (t.get("custom_fields") or []):
+                val = cf.get("value")
+                if isinstance(val, str):
+                    if not meta["mc_code"]:
+                        mc = extract_mc_from_text(val)
+                        if mc:
+                            meta["mc_code"] = mc
+                    add_brd_codes(find_all_brd(val))
+
+    # Join all BRD codes into a single cell
+    meta["brd_code"] = ", ".join(brd_accum)
 
     return meta
+
 
 # ---------- Fixed-run button ----------
 if not token:
