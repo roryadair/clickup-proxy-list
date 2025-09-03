@@ -170,21 +170,17 @@ def _parse_iso_from_text(s: str) -> Optional[str]:
     except Exception:
         return None
 
+USER_TZ = "America/Los_Angeles"  # set once near the top
+
 def merge_latest_date(current_iso: str, new_ms) -> str:
-    """Keep later date (YYYY-MM-DD) given a ClickUp ms timestamp or None.
-    Convert UTC epoch -> USER_TZ (not server local) before extracting date.
-    """
     if not new_ms:
         return current_iso
     try:
         ms = int(new_ms)
-        local_date = pd.to_datetime(ms, unit="ms", utc=True).tz_convert(USER_TZ).date()
-        new_iso = local_date.isoformat()
+        new_iso = pd.to_datetime(ms, unit="ms", utc=True).tz_convert(USER_TZ).date().isoformat()
     except Exception:
         return current_iso
-    if not current_iso:
-        return new_iso
-    return max(current_iso, new_iso)
+    return max(current_iso, new_iso) if current_iso else new_iso
 
 def merge_latest_iso(current_iso: str, new_iso: Optional[str]) -> str:
     """Keep the later of two ISO dates (YYYY-MM-DD)."""
