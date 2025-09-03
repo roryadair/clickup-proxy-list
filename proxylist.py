@@ -8,7 +8,7 @@ import requests
 import streamlit as st
 
 API_BASE = "https://api.clickup.com/api/v2"
-USER_TZ = "America/Los_Angeles"  # convert ClickUp UTC ms → this timezone → date
+USER_TZ = "America/Los_Angeles"  # Convert ClickUp UTC ms → this TZ → date
 
 # ---------- Config: fixed targets ----------
 WORKSPACE_NAME = "Fund Solution Workspace"
@@ -136,17 +136,13 @@ def find_all_brd(text: str) -> List[str]:
     return [m.group(1).upper() for m in brd_re.finditer(text)]
 
 # ---------- Label detection (fuzzy but safe) ----------
-# Accept exact "RECORD DATE"/"MEETING DATE" OR titles that *start with* those labels,
-# while rejecting range-like titles (RANGE/WINDOW/TO/BETWEEN/FROM/THRU/THROUGH).
+# Accept exact labels or titles that START with the label (e.g., "RECORD DATE: ..."),
+# while rejecting range-like titles ("RANGE", "WINDOW", "TO", etc.).
 RANGE_BLOCK = re.compile(r"^(?:[:\-–—\s]*)(RANGE|WINDOW|THRU|THROUGH|TO|BETWEEN|FROM)\b", re.IGNORECASE)
 RECORD_START = re.compile(r"^\s*RECORD\s*DATE\b(.*)$", re.IGNORECASE)
 MEETING_START = re.compile(r"^\s*MEETING\s*DATE\b(.*)$", re.IGNORECASE)
 
 def _is_single_label_task(text: str, kind: str) -> bool:
-    """
-    True if the title is exactly the label OR starts with it,
-    and the trailing part is not a range/window phrase.
-    """
     if not text:
         return False
     t = (text or "").strip()
@@ -156,7 +152,7 @@ def _is_single_label_task(text: str, kind: str) -> bool:
         if up == "RECORD DATE":
             return True
         m = RECORD_START.match(t)
-    else:  # kind == "meeting"
+    else:
         if up == "MEETING DATE":
             return True
         m = MEETING_START.match(t)
@@ -164,28 +160,46 @@ def _is_single_label_task(text: str, kind: str) -> bool:
     if not m:
         return False
     tail = (m.group(1) or "").strip()
-    # ignore leading punctuation/spaces in the tail before checking blockers
     tail = re.sub(r"^[\s:–—-]+", "", tail)
     return not RANGE_BLOCK.match(tail)
 
 # ---------- Date helpers ----------
-def merge_latest_date(current_iso: str, new_ms) -> str:
-    """Keep later date (YYYY-MM-DD) given a ClickUp ms timestamp or None, in USER_TZ."""
-    if not new_ms:
-        return current_iso
+def iso_from_ms(ms: Any) -> Optional[str]:
     try:
-        ms = int(new_ms)
-        new_iso = pd.to_datetime(ms, unit="ms", utc=True).tz_convert(USER_TZ).date().isoformat()
+        return pd.to_datetime(int(ms), unit="ms", utc=True).tz_convert(USER_TZ).date().isoformat()
     except Exception:
-        return current_iso
-    return max(current_iso, new_iso) if current_iso else new_iso
+        return None
 
-def merge_latest_iso(current_iso: str, new_iso: Optional[str]) -> str:
-    if not new_iso:
-        return current_iso
-    if not current_iso:
-        return new_iso
-    return max(current_iso, new_iso)
+def pick_best_iso(candidates: List[Tuple[str, bool]]) -> str:
+    """
+    candidates: list of (iso_date_str, is_open_status).
+    Strategy:
+      1) Prefer open tasks; else all tasks.
+      2) Among chosen set: earliest date >= today; if none, latest date < today.
+    """
+    if not candidates:
+        return ""
+    today = pd.Timestamp.now(tz=USER_TZ).date()
+
+    def pick(pool: List[str]) -> str:
+        if not pool:
+            return ""
+        dates = sorted(pd.to_datetime(pool).date())
+        future = [d for d in dates if d >= today]
+        return (min(future) if future else max(dates)).isoformat()
+
+    open_pool = [iso for iso, is_open in candidates if is_open]
+    chosen = pick(open_pool)
+    if chosen:
+        return chosen
+
+    all_pool = [iso for iso, _ in candidates]
+    return pick(all_pool)
+
+def status_is_open(t: Dict[str, Any]) -> bool:
+    stobj = t.get("status") or {}
+    # ClickUp uses status.type in {"open","closed"}; default to True if missing
+    return (stobj.get("type") or "open").lower() != "closed"
 
 # ---------- Scan a folder for codes & dates ----------
 def scan_folder_metadata(folder_id: str, token: str) -> dict:
@@ -193,9 +207,9 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
     Single-pass scan of a folder to gather:
       - mc_code: first MC####/MCA### found (lists -> tasks -> CF strings)
       - brd_code: ALL S/P/Z + 5 digits found (lists -> tasks -> CF strings), joined by ", "
-      - record_date: latest due_date from tasks labeled 'RECORD DATE' (fuzzy start match; no ranges)
-      - meeting_date: latest due_date from tasks labeled 'MEETING DATE' (fuzzy start match; no ranges)
-    NOTE: We only use the task's due_date for dates (no title/CF parsing into dates).
+      - record_date: chosen from due_date of 'RECORD DATE...' tasks (fuzzy start; no ranges)
+      - meeting_date: chosen from due_date of 'MEETING DATE...' tasks (fuzzy start; no ranges)
+    We only use due_date; no title/CF date parsing.
     """
     meta = {"mc_code": "", "brd_code": "", "record_date": "", "meeting_date": ""}
 
@@ -212,14 +226,18 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
                 seen_codes.add(c)
                 brd_accum.append(c)
 
-    # Quick pass on list names
+    # Quick pass on list names (codes only)
     for l in lists:
-        name = l.get("name") or ""
+        lname = l.get("name") or ""
         if not meta["mc_code"]:
-            mc = extract_mc_from_text(name)
+            mc = extract_mc_from_text(lname)
             if mc:
                 meta["mc_code"] = mc
-        add_brd_codes(find_all_brd(name))
+        add_brd_codes(find_all_brd(lname))
+
+    # Collect candidate dates
+    rec_candidates: List[Tuple[str, bool]] = []
+    mtg_candidates: List[Tuple[str, bool]] = []
 
     # Tasks (names + string CFs) for codes and dates
     for l in lists:
@@ -236,13 +254,18 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
             # BRD: collect all occurrences
             add_brd_codes(find_all_brd(tname))
 
-            # Dates: ONLY due_date when the title is a single-date RECORD/MEETING label
+            # Date candidates (ONLY due_date)
             if due_ms and _is_single_label_task(tname, "record"):
-                meta["record_date"] = merge_latest_date(meta["record_date"], due_ms)
-            if due_ms and _is_single_label_task(tname, "meeting"):
-                meta["meeting_date"] = merge_latest_date(meta["meeting_date"], due_ms)
+                iso = iso_from_ms(due_ms)
+                if iso:
+                    rec_candidates.append((iso, status_is_open(t)))
 
-            # String custom fields → codes only (do not parse dates from CFs)
+            if due_ms and _is_single_label_task(tname, "meeting"):
+                iso = iso_from_ms(due_ms)
+                if iso:
+                    mtg_candidates.append((iso, status_is_open(t)))
+
+            # CF strings → codes only
             for cf in (t.get("custom_fields") or []):
                 val = cf.get("value")
                 if isinstance(val, str):
@@ -251,6 +274,10 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
                         if mc:
                             meta["mc_code"] = mc
                     add_brd_codes(find_all_brd(val))
+
+    # Pick the best dates per strategy
+    meta["record_date"] = pick_best_iso(rec_candidates)
+    meta["meeting_date"] = pick_best_iso(mtg_candidates)
 
     # Join all BRD codes into a single cell
     meta["brd_code"] = ", ".join(brd_accum)
