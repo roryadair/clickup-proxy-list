@@ -7,6 +7,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
+USER_TZ = "America/Los_Angeles"  # set to your working timezone
+
 API_BASE = "https://api.clickup.com/api/v2"
 
 # ---------- Config: fixed targets ----------
@@ -141,6 +143,15 @@ LABEL_PATTERNS: Dict[str, re.Pattern] = {
     "meeting_date": re.compile(r"\bMEETING\s*DATE\b", re.IGNORECASE),
 }
 
+# Blockers that indicate it's not a single date task
+SINGLE_LABEL_BLOCKERS = re.compile(r"\b(RANGE|WINDOW|THRU|THROUGH|TO|BETWEEN|FROM)\b", re.IGNORECASE)
+
+def is_single_label_task(label_key: str, text: str) -> bool:
+    """True iff text has the label and does NOT look like a range/window."""
+    if not text or not label_in_text(label_key, text):
+        return False
+    return not SINGLE_LABEL_BLOCKERS.search(text)
+
 # Phrases that mean the label is not a single date value
 # (Removed the buggy `|S|`; added `|TO|`.)
 BAD_REMAINDER = re.compile(r"^(RANGE|WINDOW|UNTIL|THRU|THROUGH|TO)\b", re.IGNORECASE)
@@ -160,12 +171,15 @@ def _parse_iso_from_text(s: str) -> Optional[str]:
         return None
 
 def merge_latest_date(current_iso: str, new_ms) -> str:
-    """Keep later date (YYYY-MM-DD) given a ClickUp ms timestamp or None."""
+    """Keep later date (YYYY-MM-DD) given a ClickUp ms timestamp or None.
+    Convert UTC epoch -> USER_TZ (not server local) before extracting date.
+    """
     if not new_ms:
         return current_iso
     try:
-        ts = pd.to_datetime(int(new_ms), unit="ms", utc=True).tz_convert(None).date()
-        new_iso = ts.isoformat()
+        ms = int(new_ms)
+        local_date = pd.to_datetime(ms, unit="ms", utc=True).tz_convert(USER_TZ).date()
+        new_iso = local_date.isoformat()
     except Exception:
         return current_iso
     if not current_iso:
@@ -262,11 +276,12 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
             add_brd_codes(find_all_brd(tname))
 
             # ----- DATES: ONLY due_date when label is in the task title -----
-            if label_in_text("record_date", tname) and due_ms:
+            if is_single_label_task("record_date", tname) and due_ms:
                 meta["record_date"] = merge_latest_date(meta["record_date"], due_ms)
-
-            if label_in_text("meeting_date", tname) and due_ms:
+            
+            if is_single_label_task("meeting_date", tname) and due_ms:
                 meta["meeting_date"] = merge_latest_date(meta["meeting_date"], due_ms)
+
 
             # Custom fields: use ONLY for codes (no date capture from CFs)
             for cf in (t.get("custom_fields") or []):
@@ -376,6 +391,23 @@ try:
             st.divider()
             st.subheader("Preview")
             st.dataframe(out_df.head(50), use_container_width=True)
+
+if st.checkbox("Debug: show matched date tasks", value=False):
+    dbg = []
+    for f in folders:
+        for l in get_lists_in_folder(str(f["id"]), token):
+            for t in fetch_list_tasks(token, str(l["id"]), include_closed=True, include_subtasks=True, limit=100):
+                name = t.get("name") or ""
+                due_ms = t.get("due_date")
+                if not due_ms:
+                    continue
+                for key in ("record_date", "meeting_date"):
+                    if is_single_label_task(key, name):
+                        iso = pd.to_datetime(int(due_ms), unit="ms", utc=True).tz_convert(USER_TZ).date().isoformat()
+                        dbg.append({"Folder": f.get("name"), "List": l.get("name"), "Task": name, "Type": key, "Due Date": iso})
+    if dbg:
+        st.dataframe(pd.DataFrame(dbg))
+
 
 except requests.HTTPError as e:
     st.error(f"HTTP error: {e.response.status_code} {e.response.text[:300]}")
