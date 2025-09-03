@@ -1,243 +1,319 @@
-import os
+import io
 import re
-import math
-import json
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+import time
+from typing import Dict, Any, List, Tuple
 
-import requests
 import pandas as pd
+import requests
 import streamlit as st
-from dateutil import parser as dtparse
 
-# -----------------------------
-# Streamlit Page Config
-# -----------------------------
-st.set_page_config(page_title="ClickUp Data Extractor", layout="wide")
-
-st.title("ClickUp Data Extractor")
-st.caption("Fund Solution Workspace → ACTIVE Proxy Efforts (integrated fuzzy label parsing)")
-
-# -----------------------------
-# Secrets / Config
-# -----------------------------
-# Expect these in .streamlit/secrets.toml
-# [clickup]
-# token = "YOUR_CLICKUP_TOKEN"
-# list_id = "1234567890"
-
-CLICKUP_TOKEN = st.secrets.get("clickup", {}).get("token") if hasattr(st, "secrets") else os.getenv("CLICKUP_TOKEN")
-DEFAULT_LIST_ID = st.secrets.get("clickup", {}).get("list_id") if hasattr(st, "secrets") else os.getenv("CLICKUP_LIST_ID")
-
-if not CLICKUP_TOKEN:
-    st.error("Missing ClickUp token. Please add it to Streamlit secrets as [clickup].token or set CLICKUP_TOKEN env var.")
-    st.stop()
-
-list_id = DEFAULT_LIST_ID or st.text_input("ClickUp List ID", value="", help="If not provided in secrets, enter the List ID here.")
-if not list_id:
-    st.info("Provide a List ID to continue.")
-    st.stop()
-
-# -----------------------------
-# HTTP Client
-# -----------------------------
 API_BASE = "https://api.clickup.com/api/v2"
-HEADERS = {
-    "Authorization": CLICKUP_TOKEN,
-    "Content-Type": "application/json"
-}
 
+# ---------- Config: fixed targets ----------
+WORKSPACE_NAME = "Fund Solution Workspace"
+SPACE_NAME = "ACTIVE Proxy Efforts"
 
-def fetch_tasks_from_list(list_id: str, include_closed: bool = True) -> List[Dict[str, Any]]:
-    """Fetch all tasks from a ClickUp list with pagination."""
-    tasks: List[Dict[str, Any]] = []
-    page = 0
-    per_page = 100
+# ---------- Streamlit UI ----------
+st.set_page_config(page_title="ACTIVE Proxy Jobs Export", page_icon="📊")
+st.title("ACTIVE Proxy Jobs Export")
+st.caption("Exports a 6-column Excel from ClickUp → Job Number, Job Name, Broadridge MC, BRD S/P/Z Job Number, Record Date, Meeting Date.")
+
+# Always read token from Streamlit Secrets
+if "CLICKUP_TOKEN" not in st.secrets:
+    st.error("Missing CLICKUP_TOKEN in Streamlit Secrets. Please add it in app settings.")
+    st.stop()
+
+token = st.secrets["CLICKUP_TOKEN"]
+
+# ---------- HTTP helpers ----------
+def auth_headers(tok: str) -> Dict[str, str]:
+    return {"Authorization": tok, "Content-Type": "application/json"}
+
+def backoff_sleep(attempt: int) -> None:
+    time.sleep(min(10, 2 ** attempt))
+
+def get_json(url: str, headers: Dict[str, str], params: Dict[str, Any] = None) -> Dict[str, Any]:
+    attempt = 0
+    while True:
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+        if resp.status_code == 429:
+            attempt += 1
+            backoff_sleep(attempt)
+            continue
+        resp.raise_for_status()
+        return resp.json()
+
+# ---------- ClickUp discovery ----------
+def get_workspaces(token: str) -> List[Dict[str, Any]]:
+    return get_json(f"{API_BASE}/team", auth_headers(token)).get("teams", [])
+
+def get_spaces(team_id: str, token: str) -> List[Dict[str, Any]]:
+    return get_json(f"{API_BASE}/team/{team_id}/space", auth_headers(token)).get("spaces", [])
+
+def get_space_folders(space_id: str, token: str) -> List[Dict[str, Any]]:
+    return get_json(f"{API_BASE}/space/{space_id}/folder", auth_headers(token)).get("folders", [])
+
+def get_lists_in_folder(folder_id: str, token: str) -> List[Dict[str, Any]]:
+    return get_json(f"{API_BASE}/folder/{folder_id}/list", auth_headers(token)).get("lists", [])
+
+# ---------- Task fetch ----------
+def fetch_list_tasks(token: str, list_id: str, include_closed=True, include_subtasks=True, limit=100) -> List[Dict[str, Any]]:
+    headers = auth_headers(token)
+    tasks, page = [], 0
     while True:
         params = {
-            "page": page,
+            "page": page, "limit": limit,
             "include_closed": str(include_closed).lower(),
-            "subtasks": "true",
+            "subtasks": str(include_subtasks).lower(),
         }
-        url = f"{API_BASE}/list/{list_id}/task"
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=60)
-        if resp.status_code != 200:
-            raise RuntimeError(f"ClickUp API error {resp.status_code}: {resp.text}")
-        data = resp.json() or {}
-        chunk = data.get("tasks", [])
-        tasks.extend(chunk)
-        # Pagination: stop when returned less than per_page
-        if len(chunk) < per_page:
+        data = get_json(f"{API_BASE}/list/{list_id}/task", headers, params=params)
+        batch = data.get("tasks", [])
+        tasks.extend(batch)
+        if data.get("last_page") is True or len(batch) < limit:
             break
         page += 1
     return tasks
 
-# -----------------------------
-# Fuzzy label parsing utilities (integrated)
-# -----------------------------
-LABEL_PATTERNS: Dict[str, re.Pattern] = {
-    # Use strict word boundaries to avoid collisions like "RECORD DATE RANGE"
-    "record_date": re.compile(r"\bRECORD\s*DATE\b", re.IGNORECASE),
-    "meeting_date": re.compile(r"\bMEETING\s*DATE\b", re.IGNORECASE),
-    "job_number": re.compile(r"\bJOB\s*NUMBER\b", re.IGNORECASE),
-    # Add as needed:
-    # "ics_job": re.compile(r"\bICS\s*JOB\b", re.IGNORECASE),
-    # "mc_number": re.compile(r"\bMC\b", re.IGNORECASE),
-}
+# ---------- Parsing helpers ----------
+# Folder title → Job numbers + Job name
+base_re = re.compile(r"^\s*(\d{6})(.*)$")
+dash_suffix_re = re.compile(r"-\s*(\d{3})")
+comma_full_re = re.compile(r",\s*(\d{6})")
+name_after_paren_re = re.compile(r"\([^)]+\)\s*(.*)$")
+trailing_paren_number_re = re.compile(r"\(\d+\)\s*$")
 
+def parse_folder_multi(title: str) -> List[Tuple[str, str]]:
+    """Return list of (job_number, job_name) rows based on folder title rules."""
+    if not title:
+        return []
+    t = title.strip()
+    m = base_re.match(t)
+    if not m:
+        return [("", t)]
+    base_num = m.group(1)
+    remainder = m.group(2)
 
-def _clean_text(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
+    comma_nums = comma_full_re.findall(remainder)
+    prefix = base_num[:3]
+    dash_full = [prefix + s for s in dash_suffix_re.findall(remainder)]
 
+    seen, nums = set(), []
+    for n in [base_num, *comma_nums, *dash_full]:
+        if n not in seen:
+            seen.add(n)
+            nums.append(n)
 
-def _parse_date_maybe(s: str) -> Optional[str]:
-    if not s:
-        return None
-    try:
-        dt = dtparse.parse(s, fuzzy=True)
-        return dt.date().isoformat()
-    except Exception:
-        return None
+    nm_match = name_after_paren_re.search(t)
+    job_name = nm_match.group(1).strip() if nm_match else t
+    job_name = trailing_paren_number_re.sub("", job_name).strip()
+    return [(n, job_name) for n in nums]
 
+# Codes inside folder contents
+mc_re = re.compile(r"\b(?:MC\d{4}|MCA\d{3})\b", re.IGNORECASE)
+brd_re = re.compile(r"\b([SPZ]\d{5})\b", re.IGNORECASE)
 
-def _label_matches(key: str, label_re: re.Pattern) -> bool:
-    return bool(label_re.search(key))
+def find_all_brd(text: str) -> list[str]:
+    """Return ALL BRD codes (S#####/P#####/Z#####) in order of appearance, uppercased."""
+    if not text:
+        return []
+    return [m.group(1).upper() for m in brd_re.finditer(text)]
 
-
-def _value_from_key_trailer(key: str, label_re: re.Pattern) -> Optional[str]:
-    m = re.search(rf"{label_re.pattern}[:\-\s]*(.+)$", key, re.IGNORECASE)
-    if m:
-        return _clean_text(m.group(1))
-    return None
-
-
-def extract_field_value(
-    items: Iterable[Mapping[str, Any]],
-    label_key: str,
-    prefer_parsed_date: bool = True,
-) -> Optional[str]:
-    """Generic extractor using fuzzy label matching.
-    Prefers the associated field 'value'; falls back to extracting from the key itself.
-    Optionally parses dates into ISO.
-    """
-    label_re = LABEL_PATTERNS[label_key]
-
-    for item in items:
-        key = str(item.get("name", "") or "")
-        val = item.get("value", "")
-        val_str = "" if val is None else str(val)
-
-        if not _label_matches(key, label_re):
-            continue
-
-        candidate = _clean_text(val_str)
-        if not candidate:
-            candidate = _value_from_key_trailer(key, label_re) or ""
-        candidate = _clean_text(candidate)
-        if not candidate:
-            continue
-
-        if prefer_parsed_date and label_key.endswith("_date"):
-            parsed = _parse_date_maybe(candidate)
-            if parsed:
-                return parsed
-        return candidate
-
-    return None
-
-# -----------------------------
-# Domain-specific helpers
-# -----------------------------
-CODE_PATTERN = re.compile(r"\b([SPZ]\d{5,})\b", re.IGNORECASE)
-
-
-def extract_all_codes(text: str) -> str:
-    """Capture multiple S##### / P##### / Z##### codes, unique, keep order of first appearance."""
+def extract_brd_from_text(text: str) -> str:
     if not text:
         return ""
-    matches = CODE_PATTERN.findall(text)
-    if not matches:
-        return ""
-    # preserve order while deduping
-    seen = set()
-    ordered = []
-    for m in matches:
-        u = m.upper()
-        if u not in seen:
-            seen.add(u)
-            ordered.append(u)
-    return ", ".join(ordered)
+    m = brd_re.search(text)
+    return m.group(1).upper() if m else ""
 
+def normalize_title(s: str) -> str:
+    return (s or "").strip().upper()
 
-# -----------------------------
-# Build dataframe from tasks
-# -----------------------------
-
-def tasks_to_dataframe(tasks: List[Dict[str, Any]]) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-
-    for t in tasks:
-        name = t.get("name", "")
-        desc = t.get("text_content") or t.get("description") or ""
-        custom_fields = t.get("custom_fields", [])
-
-        # Fuzzy-extracted fields
-        record_date = extract_field_value(custom_fields, "record_date")
-        meeting_date = extract_field_value(custom_fields, "meeting_date")
-        job_number = extract_field_value(custom_fields, "job_number", prefer_parsed_date=False)
-
-        # Multi-code extraction from name + description
-        codes = extract_all_codes(" ".join([name or "", desc or ""]))
-
-        rows.append({
-            "Task ID": t.get("id"),
-            "Task Name": name,
-            "URL": t.get("url"),
-            "Status": (t.get("status") or {}).get("status"),
-            "Assignees": ", ".join([a.get("username") or a.get("email") or a.get("id") for a in t.get("assignees", [])]) if t.get("assignees") else "",
-            "Record Date": record_date,
-            "Meeting Date": meeting_date,
-            "Job Number": job_number,
-            "Codes (S/P/Z)": codes,
-        })
-
-    df = pd.DataFrame(rows)
-
-    # Remove the known non-entry row "PROJECT LIST TEMPLATE"
-    if not df.empty and "Task Name" in df.columns:
-        df = df[df["Task Name"].str.strip().str.upper() != "PROJECT LIST TEMPLATE"].copy()
-
-    # Optional: sort
-    if "Record Date" in df.columns:
-        # Safe sort: parse dates, fallback to NaT
-        df["Record Date (sort)"] = pd.to_datetime(df["Record Date"], errors="coerce")
-        df = df.sort_values(["Record Date (sort)", "Task Name"], na_position="last").drop(columns=["Record Date (sort)"])
-
-    return df.reset_index(drop=True)
-
-# -----------------------------
-# Run
-# -----------------------------
-with st.spinner("Fetching tasks from ClickUp…"):
+def merge_latest_date(current_iso: str, new_ms) -> str:
+    """Keep later date (YYYY-MM-DD) given a ClickUp ms timestamp or None."""
+    if not new_ms:
+        return current_iso
     try:
-        tasks = fetch_tasks_from_list(list_id)
-    except Exception as e:
-        st.exception(e)
-        st.stop()
+        ts = pd.to_datetime(int(new_ms), unit="ms", utc=True).tz_convert(None).date()
+        new_iso = ts.isoformat()
+    except Exception:
+        return current_iso
+    if not current_iso:
+        return new_iso
+    return max(current_iso, new_iso)
 
-st.success(f"Fetched {len(tasks)} tasks.")
+# Regex patterns
+mc_re = re.compile(r"\b(?:MC\d{4}|MCA\d{3})\b", re.IGNORECASE)
+brd_re = re.compile(r"\b([SPZ]\d{5})\b", re.IGNORECASE)
 
-# Build and show dataframe
-with st.spinner("Parsing tasks…"):
-    df = tasks_to_dataframe(tasks)
+def extract_mc_from_text(text: str) -> str:
+    """Return the first MC#### or MCA### code in a given text string, or '' if none."""
+    if not text:
+        return ""
+    m = mc_re.search(text)
+    return m.group(0).upper() if m else ""
 
-st.dataframe(df, use_container_width=True)
+def find_all_brd(text: str) -> list[str]:
+    """Return ALL BRD codes (S#####/P#####/Z#####) in order of appearance, uppercased."""
+    if not text:
+        return []
+    return [m.group(1).upper() for m in brd_re.finditer(text)]
 
-# Download buttons
-@st.cache_data
-def df_to_csv_bytes(dataframe: pd.DataFrame) -> bytes:
-    return dataframe.to_csv(index=False).encode("utf-8")
 
-csv_bytes = df_to_csv_bytes(df)
-st.download_button("Download CSV", data=csv_bytes, file_name="clickup_tasks.csv", mime="text/csv")
+def scan_folder_metadata(folder_id: str, token: str) -> dict:
+    """
+    Single-pass scan of a folder to gather:
+      - mc_code: first MC####/MCA### found (lists -> tasks -> CF strings)
+      - brd_code: ALL S/P/Z + 5 digits found (lists -> tasks -> CF strings), joined by ", "
+      - record_date: latest due_date from tasks named 'RECORD DATE'
+      - meeting_date: latest due_date from tasks named 'MEETING DATE'
+    """
+    meta = {"mc_code": "", "brd_code": "", "record_date": "", "meeting_date": ""}
 
-st.caption("Tip: Add/adjust LABEL_PATTERNS in this file to catch other fuzzy labels (e.g., ICS Job, MC, etc.) while always preferring the associated field value when present.")
+    lists = get_lists_in_folder(folder_id, token)
+
+    # Helper: append codes preserving first-seen order (no duplicates)
+    brd_accum: list[str] = []
+    seen = set()
+    def add_brd_codes(codes: list[str]):
+        nonlocal brd_accum, seen
+        for c in codes:
+            if c not in seen:
+                seen.add(c)
+                brd_accum.append(c)
+
+    # Quick pass on list names
+    for l in lists:
+        name = l.get("name") or ""
+        if not meta["mc_code"]:
+            mc = extract_mc_from_text(name)
+            if mc:
+                meta["mc_code"] = mc
+        add_brd_codes(find_all_brd(name))
+
+    # Tasks (names + string CFs) for codes and dates
+    for l in lists:
+        for t in fetch_list_tasks(token, str(l["id"]), include_closed=True, include_subtasks=True, limit=100):
+            tname = t.get("name") or ""
+
+            # MC first-hit only
+            if not meta["mc_code"]:
+                mc = extract_mc_from_text(tname)
+                if mc:
+                    meta["mc_code"] = mc
+
+            # BRD: collect all occurrences
+            add_brd_codes(find_all_brd(tname))
+
+            # Dates
+            title_norm = normalize_title(tname)
+            if title_norm == "RECORD DATE":
+                meta["record_date"] = merge_latest_date(meta["record_date"], t.get("due_date"))
+            elif title_norm == "MEETING DATE":
+                meta["meeting_date"] = merge_latest_date(meta["meeting_date"], t.get("due_date"))
+
+            # String custom fields
+            for cf in (t.get("custom_fields") or []):
+                val = cf.get("value")
+                if isinstance(val, str):
+                    if not meta["mc_code"]:
+                        mc = extract_mc_from_text(val)
+                        if mc:
+                            meta["mc_code"] = mc
+                    add_brd_codes(find_all_brd(val))
+
+    # Join all BRD codes into a single cell
+    meta["brd_code"] = ", ".join(brd_accum)
+
+    return meta
+
+
+# ---------- Fixed-run button ----------
+if not token:
+    st.warning("Add your ClickUp token to proceed (paste above or set in Streamlit Secrets).")
+    st.stop()
+
+run = st.button("Build & Export", type="primary", use_container_width=True)
+
+try:
+    if run:
+        with st.spinner("Resolving Workspace and Space…"):
+            teams = get_workspaces(token)
+            ws = next((t for t in teams if (t.get("name") or "").strip().lower() == WORKSPACE_NAME.lower()), None)
+            if not ws:
+                st.error(f'Workspace "{WORKSPACE_NAME}" not found for this token.')
+                st.stop()
+            team_id = str(ws["id"])
+
+            spaces = get_spaces(team_id, token)
+            space = next((s for s in spaces if (s.get("name") or "").strip().lower() == SPACE_NAME.lower()), None)
+            if not space:
+                st.error(f'Space "{SPACE_NAME}" not found in workspace "{WORKSPACE_NAME}".')
+                st.stop()
+            space_id = str(space["id"])
+
+        with st.spinner("Scanning folders and building dataset…"):
+            folders = get_space_folders(space_id, token)
+
+            rows: List[Dict[str, Any]] = []
+            for f in folders:
+                folder_id = str(f.get("id"))
+                title = f.get("name") or ""
+
+                jobs = parse_folder_multi(title)
+                meta = scan_folder_metadata(folder_id, token)
+
+                for job_num, job_name in jobs:
+                    rows.append({
+                        "Job Number": job_num,
+                        "Job Name": job_name,
+                        "Broadridge MC": meta["mc_code"],
+                        "BRD S or P Job Number": meta["brd_code"],
+                        "Record Date": meta["record_date"],
+                        "Meeting Date": meta["meeting_date"],
+                        "Folder ID": folder_id,
+                        "Folder Title": title,
+                    })
+
+            df = pd.DataFrame(rows)
+
+            # Remove placeholder rows (e.g. PROJECT LIST TEMPLATE)
+            df = df[df["Job Name"].str.upper() != "PROJECT LIST TEMPLATE"]
+            
+            df = df.sort_values(["Job Number", "Job Name"], na_position="last").reset_index(drop=True)
+
+            # Shape final columns and convert dates to true date objects
+            final_cols = [
+                "Job Number",
+                "Job Name",
+                "Broadridge MC",
+                "BRD S or P Job Number",
+                "Record Date",
+                "Meeting Date",
+            ]
+            out_df = df.reindex(columns=final_cols).copy()
+            for col in ["Record Date", "Meeting Date"]:
+                out_df[col] = pd.to_datetime(out_df[col], errors="coerce").dt.date
+            out_df = out_df.where(pd.notnull(out_df), "")
+
+            # Write Excel to memory
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl", date_format="YYYY-MM-DD") as xw:
+                out_df.to_excel(xw, index=False, sheet_name="Jobs")
+            buf.seek(0)
+
+            st.success(f"Built {len(out_df)} rows from '{WORKSPACE_NAME}' → '{SPACE_NAME}'.")
+            st.download_button(
+                "Download ACTIVE_Proxy_Jobs.xlsx",
+                data=buf.getvalue(),
+                file_name="ACTIVE_Proxy_Jobs.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+            st.divider()
+            st.subheader("Preview")
+            st.dataframe(out_df.head(50), use_container_width=True)
+
+except requests.HTTPError as e:
+    st.error(f"HTTP error: {e.response.status_code} {e.response.text[:300]}")
+except Exception as e:
+    st.error(f"Unexpected error: {e}")
