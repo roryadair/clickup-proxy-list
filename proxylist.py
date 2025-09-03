@@ -212,20 +212,19 @@ def parse_any_date_value(v: Any) -> Optional[str]:
         return _parse_iso_from_text(v)
     return None
 
-# ---------- Scan a folder for codes & dates ----------
 def scan_folder_metadata(folder_id: str, token: str) -> dict:
     """
     Single-pass scan of a folder to gather:
       - mc_code: first MC####/MCA### found (lists -> tasks -> CF strings)
       - brd_code: ALL S/P/Z + 5 digits found (lists -> tasks -> CF strings), joined by ", "
-      - record_date: latest date from tasks/custom-fields labelled like 'RECORD DATE' (prefer due_date)
-      - meeting_date: latest date from tasks/custom-fields labelled like 'MEETING DATE' (prefer due_date)
+      - record_date: latest date from tasks labelled like 'RECORD DATE' (prefer due_date, else parse title)
+      - meeting_date: latest date from tasks labelled like 'MEETING DATE' (prefer due_date, else parse title)
     """
     meta = {"mc_code": "", "brd_code": "", "record_date": "", "meeting_date": ""}
 
     lists = get_lists_in_folder(folder_id, token)
 
-    # Helper: append codes preserving first-seen order (no duplicates)
+    # Helper: append BRD codes preserving first-seen order (no duplicates)
     brd_accum: List[str] = []
     seen_codes = set()
 
@@ -236,7 +235,7 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
                 seen_codes.add(c)
                 brd_accum.append(c)
 
-    # Quick pass on list names
+    # Quick pass on list names for codes
     for l in lists:
         name = l.get("name") or ""
         if not meta["mc_code"]:
@@ -257,15 +256,15 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
                 if mc:
                     meta["mc_code"] = mc
 
-            # BRD: collect all occurrences
+            # BRD: collect all occurrences from title
             add_brd_codes(find_all_brd(tname))
 
-            # ---- RECORD DATE (prefer due_date; else parse from trailing text; also check CFs) ----
+            # ---- RECORD DATE: prefer due_date, else parse from title ----
             if label_in_text("record_date", tname):
                 if due_ms:
                     meta["record_date"] = merge_latest_date(meta["record_date"], due_ms)
                 else:
-                    # 1) Try text after label
+                    # 1) Try text after the label
                     tail = extract_trailing_after_label("record_date", tname)
                     iso = _parse_iso_from_text(tail)
                     # 2) Fallback: fuzzy-parse anywhere in the title
@@ -273,12 +272,12 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
                         iso = _parse_iso_from_text(tname)
                     meta["record_date"] = merge_latest_iso(meta["record_date"], iso)
 
-            # ---- MEETING DATE (same approach) ----
+            # ---- MEETING DATE: prefer due_date, else parse from title ----
             if label_in_text("meeting_date", tname):
                 if due_ms:
                     meta["meeting_date"] = merge_latest_date(meta["meeting_date"], due_ms)
                 else:
-                    # 1) Try text after label
+                    # 1) Try text after the label
                     tail = extract_trailing_after_label("meeting_date", tname)
                     iso = _parse_iso_from_text(tail)
                     # 2) Fallback: fuzzy-parse anywhere in the title
@@ -286,36 +285,15 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
                         iso = _parse_iso_from_text(tname)
                     meta["meeting_date"] = merge_latest_iso(meta["meeting_date"], iso)
 
-            # String custom fields for codes; date custom fields by label
+            # String custom fields: still scan for codes only (NOT dates)
             for cf in (t.get("custom_fields") or []):
-                cf_name = cf.get("name") or ""
                 val = cf.get("value")
-                # Codes from string CFs
                 if isinstance(val, str):
                     if not meta["mc_code"]:
                         mc = extract_mc_from_text(val)
                         if mc:
                             meta["mc_code"] = mc
                     add_brd_codes(find_all_brd(val))
-                # Dates: if CF name looks like RECORD/MEETING DATE, prefer its value
-                if label_in_text("record_date", cf_name):
-                    iso = parse_any_date_value(val)
-                    if not iso:
-                        tail = extract_trailing_after_label("record_date", cf_name)
-                        iso = _parse_iso_from_text(tail)
-                    # Fallback: fuzzy-parse anywhere in the CF name
-                    if not iso:
-                        iso = _parse_iso_from_text(cf_name)
-                    meta["record_date"] = merge_latest_iso(meta["record_date"], iso)
-                if label_in_text("meeting_date", cf_name):
-                    iso = parse_any_date_value(val)
-                    if not iso:
-                        tail = extract_trailing_after_label("meeting_date", cf_name)
-                        iso = _parse_iso_from_text(tail)
-                    # Fallback: fuzzy-parse anywhere in the CF name
-                    if not iso:
-                        iso = _parse_iso_from_text(cf_name)
-                    meta["meeting_date"] = merge_latest_iso(meta["meeting_date"], iso)
 
     # Join all BRD codes into a single cell
     meta["brd_code"] = ", ".join(brd_accum)
