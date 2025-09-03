@@ -18,8 +18,12 @@ st.set_page_config(page_title="ACTIVE Proxy Jobs Export", page_icon="📊")
 st.title("ACTIVE Proxy Jobs Export")
 st.caption("Exports a 6-column Excel from ClickUp → Job Number, Job Name, Broadridge MC, BRD S/P/Z Job Number, Record Date, Meeting Date.")
 
-token_default = st.secrets.get("CLICKUP_TOKEN", "")
-token = st.text_input("ClickUp token (pk_…)", value=token_default, type="password")
+# Always read token from Streamlit Secrets
+if "CLICKUP_TOKEN" not in st.secrets:
+    st.error("Missing CLICKUP_TOKEN in Streamlit Secrets. Please add it in app settings.")
+    st.stop()
+
+token = st.secrets["CLICKUP_TOKEN"]
 
 # ---------- HTTP helpers ----------
 def auth_headers(tok: str) -> Dict[str, str]:
