@@ -1,7 +1,7 @@
 import io
 import re
 import time
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import pandas as pd
 import requests
@@ -16,7 +16,9 @@ SPACE_NAME = "ACTIVE Proxy Efforts"
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title="ACTIVE Proxy Jobs Export", page_icon="📊")
 st.title("ACTIVE Proxy Jobs Export")
-st.caption("Exports a 6-column Excel from ClickUp → Job Number, Job Name, Broadridge MC, BRD S/P/Z Job Number, Record Date, Meeting Date.")
+st.caption(
+    "Exports a 6-column Excel from ClickUp → Job Number, Job Name, Broadridge MC, BRD S/P/Z Job Number, Record Date, Meeting Date."
+)
 
 # Always read token from Streamlit Secrets
 if "CLICKUP_TOKEN" not in st.secrets:
@@ -29,8 +31,10 @@ token = st.secrets["CLICKUP_TOKEN"]
 def auth_headers(tok: str) -> Dict[str, str]:
     return {"Authorization": tok, "Content-Type": "application/json"}
 
+
 def backoff_sleep(attempt: int) -> None:
     time.sleep(min(10, 2 ** attempt))
+
 
 def get_json(url: str, headers: Dict[str, str], params: Dict[str, Any] = None) -> Dict[str, Any]:
     attempt = 0
@@ -43,26 +47,38 @@ def get_json(url: str, headers: Dict[str, str], params: Dict[str, Any] = None) -
         resp.raise_for_status()
         return resp.json()
 
+
 # ---------- ClickUp discovery ----------
 def get_workspaces(token: str) -> List[Dict[str, Any]]:
     return get_json(f"{API_BASE}/team", auth_headers(token)).get("teams", [])
 
+
 def get_spaces(team_id: str, token: str) -> List[Dict[str, Any]]:
     return get_json(f"{API_BASE}/team/{team_id}/space", auth_headers(token)).get("spaces", [])
+
 
 def get_space_folders(space_id: str, token: str) -> List[Dict[str, Any]]:
     return get_json(f"{API_BASE}/space/{space_id}/folder", auth_headers(token)).get("folders", [])
 
+
 def get_lists_in_folder(folder_id: str, token: str) -> List[Dict[str, Any]]:
     return get_json(f"{API_BASE}/folder/{folder_id}/list", auth_headers(token)).get("lists", [])
 
+
 # ---------- Task fetch ----------
-def fetch_list_tasks(token: str, list_id: str, include_closed=True, include_subtasks=True, limit=100) -> List[Dict[str, Any]]:
+def fetch_list_tasks(
+    token: str,
+    list_id: str,
+    include_closed: bool = True,
+    include_subtasks: bool = True,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
     headers = auth_headers(token)
     tasks, page = [], 0
     while True:
         params = {
-            "page": page, "limit": limit,
+            "page": page,
+            "limit": limit,
             "include_closed": str(include_closed).lower(),
             "subtasks": str(include_subtasks).lower(),
         }
@@ -74,6 +90,7 @@ def fetch_list_tasks(token: str, list_id: str, include_closed=True, include_subt
         page += 1
     return tasks
 
+
 # ---------- Parsing helpers ----------
 # Folder title → Job numbers + Job name
 base_re = re.compile(r"^\s*(\d{6})(.*)$")
@@ -81,6 +98,7 @@ dash_suffix_re = re.compile(r"-\s*(\d{3})")
 comma_full_re = re.compile(r",\s*(\d{6})")
 name_after_paren_re = re.compile(r"\([^)]+\)\s*(.*)$")
 trailing_paren_number_re = re.compile(r"\(\d+\)\s*$")
+
 
 def parse_folder_multi(title: str) -> List[Tuple[str, str]]:
     """Return list of (job_number, job_name) rows based on folder title rules."""
@@ -108,24 +126,54 @@ def parse_folder_multi(title: str) -> List[Tuple[str, str]]:
     job_name = trailing_paren_number_re.sub("", job_name).strip()
     return [(n, job_name) for n in nums]
 
+
 # Codes inside folder contents
 mc_re = re.compile(r"\b(?:MC\d{4}|MCA\d{3})\b", re.IGNORECASE)
 brd_re = re.compile(r"\b([SPZ]\d{5})\b", re.IGNORECASE)
 
-def find_all_brd(text: str) -> list[str]:
+
+def extract_mc_from_text(text: str) -> str:
+    """Return the first MC#### or MCA### code in a given text string, or '' if none."""
+    if not text:
+        return ""
+    m = mc_re.search(text)
+    return m.group(0).upper() if m else ""
+
+
+def find_all_brd(text: str) -> List[str]:
     """Return ALL BRD codes (S#####/P#####/Z#####) in order of appearance, uppercased."""
     if not text:
         return []
     return [m.group(1).upper() for m in brd_re.finditer(text)]
 
-def extract_brd_from_text(text: str) -> str:
-    if not text:
-        return ""
-    m = brd_re.search(text)
-    return m.group(1).upper() if m else ""
 
-def normalize_title(s: str) -> str:
-    return (s or "").strip().upper()
+# ---------- Date label parsing (fuzzy, with fallback) ----------
+# Word-boundary label matchers; we avoid false hits like "RECORD DATE RANGE"
+LABEL_PATTERNS: Dict[str, re.Pattern] = {
+    "record_date": re.compile(r"\bRECORD\s*DATE\b", re.IGNORECASE),
+    "meeting_date": re.compile(r"\bMEETING\s*DATE\b", re.IGNORECASE),
+}
+
+# Phrases that mean the label is not a single date value
+BAD_REMAINDER = re.compile(r"^(RANGE|WINDOW|S|UNTIL|THRU|THROUGH)\b", re.IGNORECASE)
+
+
+def _clean_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _parse_iso_from_text(s: str) -> Optional[str]:
+    if not s:
+        return None
+    try:
+        ts = pd.to_datetime(s, errors="coerce")
+        if pd.isna(ts):
+            return None
+        # Assume naive local; convert to date only
+        return ts.date().isoformat()
+    except Exception:
+        return None
+
 
 def merge_latest_date(current_iso: str, new_ms) -> str:
     """Keep later date (YYYY-MM-DD) given a ClickUp ms timestamp or None."""
@@ -140,44 +188,75 @@ def merge_latest_date(current_iso: str, new_ms) -> str:
         return new_iso
     return max(current_iso, new_iso)
 
-# Regex patterns
-mc_re = re.compile(r"\b(?:MC\d{4}|MCA\d{3})\b", re.IGNORECASE)
-brd_re = re.compile(r"\b([SPZ]\d{5})\b", re.IGNORECASE)
 
-def extract_mc_from_text(text: str) -> str:
-    """Return the first MC#### or MCA### code in a given text string, or '' if none."""
-    if not text:
+def merge_latest_iso(current_iso: str, new_iso: Optional[str]) -> str:
+    """Keep the later of two ISO dates (YYYY-MM-DD)."""
+    if not new_iso:
+        return current_iso
+    if not current_iso:
+        return new_iso
+    return max(current_iso, new_iso)
+
+
+def label_in_text(label_key: str, text: str) -> bool:
+    pat = LABEL_PATTERNS[label_key]
+    return bool(pat.search(text or ""))
+
+
+def extract_trailing_after_label(label_key: str, text: str) -> str:
+    """If label appears in text (e.g., 'RECORD DATE: APRIL 17, 2025'), return the trailing part."""
+    pat = LABEL_PATTERNS[label_key]
+    m = re.search(rf"{pat.pattern}[:\-\s]*(.+)$", text or "", re.IGNORECASE)
+    if not m:
         return ""
-    m = mc_re.search(text)
-    return m.group(0).upper() if m else ""
+    tail = _clean_text(m.group(1))
+    # Guard against RANGE-like remainders
+    if BAD_REMAINDER.match(tail):
+        return ""
+    return tail
 
-def find_all_brd(text: str) -> list[str]:
-    """Return ALL BRD codes (S#####/P#####/Z#####) in order of appearance, uppercased."""
-    if not text:
-        return []
-    return [m.group(1).upper() for m in brd_re.finditer(text)]
 
+def parse_any_date_value(v: Any) -> Optional[str]:
+    """Parse ClickUp date-like values to ISO. Supports ms epoch ints and strings like 'Apr 17, 2025'."""
+    if v is None:
+        return None
+    # numeric epoch (assume ms)
+    try:
+        if isinstance(v, (int, float)) or (isinstance(v, str) and v.isdigit()):
+            ms = int(v)
+            ts = pd.to_datetime(ms, unit="ms", utc=True).tz_convert(None).date()
+            return ts.isoformat()
+    except Exception:
+        pass
+    # string date
+    if isinstance(v, str):
+        return _parse_iso_from_text(v)
+    return None
+
+
+# ---------- Scan a folder for codes & dates ----------
 
 def scan_folder_metadata(folder_id: str, token: str) -> dict:
     """
     Single-pass scan of a folder to gather:
       - mc_code: first MC####/MCA### found (lists -> tasks -> CF strings)
       - brd_code: ALL S/P/Z + 5 digits found (lists -> tasks -> CF strings), joined by ", "
-      - record_date: latest due_date from tasks named 'RECORD DATE'
-      - meeting_date: latest due_date from tasks named 'MEETING DATE'
+      - record_date: latest date from tasks/custom-fields labelled like 'RECORD DATE' (prefer due_date)
+      - meeting_date: latest date from tasks/custom-fields labelled like 'MEETING DATE' (prefer due_date)
     """
     meta = {"mc_code": "", "brd_code": "", "record_date": "", "meeting_date": ""}
 
     lists = get_lists_in_folder(folder_id, token)
 
     # Helper: append codes preserving first-seen order (no duplicates)
-    brd_accum: list[str] = []
-    seen = set()
-    def add_brd_codes(codes: list[str]):
-        nonlocal brd_accum, seen
+    brd_accum: List[str] = []
+    seen_codes = set()
+
+    def add_brd_codes(codes: List[str]):
+        nonlocal brd_accum, seen_codes
         for c in codes:
-            if c not in seen:
-                seen.add(c)
+            if c not in seen_codes:
+                seen_codes.add(c)
                 brd_accum.append(c)
 
     # Quick pass on list names
@@ -193,6 +272,7 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
     for l in lists:
         for t in fetch_list_tasks(token, str(l["id"]), include_closed=True, include_subtasks=True, limit=100):
             tname = t.get("name") or ""
+            due_ms = t.get("due_date")
 
             # MC first-hit only
             if not meta["mc_code"]:
@@ -203,26 +283,49 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
             # BRD: collect all occurrences
             add_brd_codes(find_all_brd(tname))
 
-            # Dates
-            title_norm = normalize_title(tname)
-            if title_norm == "RECORD DATE":
-                meta["record_date"] = merge_latest_date(meta["record_date"], t.get("due_date"))
-            elif title_norm == "MEETING DATE":
-                meta["meeting_date"] = merge_latest_date(meta["meeting_date"], t.get("due_date"))
+            # ---- RECORD DATE (prefer due_date; else parse from trailing text; also check CFs) ----
+            if label_in_text("record_date", tname):
+                if due_ms:
+                    meta["record_date"] = merge_latest_date(meta["record_date"], due_ms)
+                else:
+                    tail = extract_trailing_after_label("record_date", tname)
+                    meta["record_date"] = merge_latest_iso(meta["record_date"], _parse_iso_from_text(tail))
 
-            # String custom fields
+            # ---- MEETING DATE (same approach) ----
+            if label_in_text("meeting_date", tname):
+                if due_ms:
+                    meta["meeting_date"] = merge_latest_date(meta["meeting_date"], due_ms)
+                else:
+                    tail = extract_trailing_after_label("meeting_date", tname)
+                    meta["meeting_date"] = merge_latest_iso(meta["meeting_date"], _parse_iso_from_text(tail))
+
+            # String custom fields for codes; date custom fields by label
             for cf in (t.get("custom_fields") or []):
+                cf_name = cf.get("name") or ""
                 val = cf.get("value")
+                # Codes from string CFs
                 if isinstance(val, str):
                     if not meta["mc_code"]:
                         mc = extract_mc_from_text(val)
                         if mc:
                             meta["mc_code"] = mc
                     add_brd_codes(find_all_brd(val))
+                # Dates: if CF name looks like RECORD/MEETING DATE, prefer its value
+                if label_in_text("record_date", cf_name):
+                    iso = parse_any_date_value(val)
+                    if not iso:
+                        tail = extract_trailing_after_label("record_date", cf_name)
+                        iso = _parse_iso_from_text(tail)
+                    meta["record_date"] = merge_latest_iso(meta["record_date"], iso)
+                if label_in_text("meeting_date", cf_name):
+                    iso = parse_any_date_value(val)
+                    if not iso:
+                        tail = extract_trailing_after_label("meeting_date", cf_name)
+                        iso = _parse_iso_from_text(tail)
+                    meta["meeting_date"] = merge_latest_iso(meta["meeting_date"], iso)
 
     # Join all BRD codes into a single cell
     meta["brd_code"] = ", ".join(brd_accum)
-
     return meta
 
 
@@ -237,14 +340,20 @@ try:
     if run:
         with st.spinner("Resolving Workspace and Space…"):
             teams = get_workspaces(token)
-            ws = next((t for t in teams if (t.get("name") or "").strip().lower() == WORKSPACE_NAME.lower()), None)
+            ws = next(
+                (t for t in teams if (t.get("name") or "").strip().lower() == WORKSPACE_NAME.lower()),
+                None,
+            )
             if not ws:
                 st.error(f'Workspace "{WORKSPACE_NAME}" not found for this token.')
                 st.stop()
             team_id = str(ws["id"])
 
             spaces = get_spaces(team_id, token)
-            space = next((s for s in spaces if (s.get("name") or "").strip().lower() == SPACE_NAME.lower()), None)
+            space = next(
+                (s for s in spaces if (s.get("name") or "").strip().lower() == SPACE_NAME.lower()),
+                None,
+            )
             if not space:
                 st.error(f'Space "{SPACE_NAME}" not found in workspace "{WORKSPACE_NAME}".')
                 st.stop()
@@ -262,22 +371,24 @@ try:
                 meta = scan_folder_metadata(folder_id, token)
 
                 for job_num, job_name in jobs:
-                    rows.append({
-                        "Job Number": job_num,
-                        "Job Name": job_name,
-                        "Broadridge MC": meta["mc_code"],
-                        "BRD S or P Job Number": meta["brd_code"],
-                        "Record Date": meta["record_date"],
-                        "Meeting Date": meta["meeting_date"],
-                        "Folder ID": folder_id,
-                        "Folder Title": title,
-                    })
+                    rows.append(
+                        {
+                            "Job Number": job_num,
+                            "Job Name": job_name,
+                            "Broadridge MC": meta["mc_code"],
+                            "BRD S or P Job Number": meta["brd_code"],
+                            "Record Date": meta["record_date"],
+                            "Meeting Date": meta["meeting_date"],
+                            "Folder ID": folder_id,
+                            "Folder Title": title,
+                        }
+                    )
 
             df = pd.DataFrame(rows)
 
             # Remove placeholder rows (e.g. PROJECT LIST TEMPLATE)
             df = df[df["Job Name"].str.upper() != "PROJECT LIST TEMPLATE"]
-            
+
             df = df.sort_values(["Job Number", "Job Name"], na_position="last").reset_index(drop=True)
 
             # Shape final columns and convert dates to true date objects
