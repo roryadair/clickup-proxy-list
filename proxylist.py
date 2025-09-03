@@ -392,6 +392,11 @@ try:
             st.subheader("Preview")
             st.dataframe(out_df.head(50), use_container_width=True)
 
+except requests.HTTPError as e:
+    st.error(f"HTTP error: {e.response.status_code} {e.response.text[:300]}")
+except Exception as e:
+    st.error(f"Unexpected error: {e}")
+
 if st.checkbox("Debug: show matched date tasks", value=False):
     dbg = []
     for f in folders:
@@ -407,9 +412,3 @@ if st.checkbox("Debug: show matched date tasks", value=False):
                         dbg.append({"Folder": f.get("name"), "List": l.get("name"), "Task": name, "Type": key, "Due Date": iso})
     if dbg:
         st.dataframe(pd.DataFrame(dbg))
-
-
-except requests.HTTPError as e:
-    st.error(f"HTTP error: {e.response.status_code} {e.response.text[:300]}")
-except Exception as e:
-    st.error(f"Unexpected error: {e}")
