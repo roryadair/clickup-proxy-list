@@ -179,22 +179,27 @@ def pick_best_iso(candidates: List[Tuple[str, bool]]) -> str:
     """
     if not candidates:
         return ""
+
     today = pd.Timestamp.now(tz=USER_TZ).date()
 
     def pick(pool: List[str]) -> str:
         if not pool:
             return ""
-        dates = sorted(pd.to_datetime(pool).date())
+        dti = pd.to_datetime(pool, errors="coerce")
+        # Convert each timestamp to a Python date; skip NaT
+        dates = sorted([ts.date() for ts in dti if not pd.isna(ts)])
+        if not dates:
+            return ""
         future = [d for d in dates if d >= today]
-        return (min(future) if future else max(dates)).isoformat()
+        chosen = min(future) if future else max(dates)
+        return chosen.isoformat()
 
     open_pool = [iso for iso, is_open in candidates if is_open]
     chosen = pick(open_pool)
     if chosen:
         return chosen
 
-    all_pool = [iso for iso, _ in candidates]
-    return pick(all_pool)
+    return pick([iso for iso, _ in candidates])
 
 def status_is_open(t: Dict[str, Any]) -> bool:
     stobj = t.get("status") or {}
