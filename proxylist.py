@@ -1,13 +1,14 @@
 import io
 import re
 import time
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import pandas as pd
 import requests
 import streamlit as st
 
 API_BASE = "https://api.clickup.com/api/v2"
+USER_TZ = "America/Los_Angeles"  # convert ClickUp UTC ms → this timezone → date
 
 # ---------- Config: fixed targets ----------
 WORKSPACE_NAME = "Fund Solution Workspace"
@@ -16,7 +17,9 @@ SPACE_NAME = "ACTIVE Proxy Efforts"
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title="ACTIVE Proxy Jobs Export", page_icon="📊")
 st.title("ACTIVE Proxy Jobs Export")
-st.caption("Exports a 6-column Excel from ClickUp → Job Number, Job Name, Broadridge MC, BRD S/P/Z Job Number, Record Date, Meeting Date.")
+st.caption(
+    "Exports a 6-column Excel from ClickUp → Job Number, Job Name, Broadridge MC, BRD S/P/Z Job Number, Record Date, Meeting Date."
+)
 
 # Always read token from Streamlit Secrets
 if "CLICKUP_TOKEN" not in st.secrets:
@@ -57,12 +60,19 @@ def get_lists_in_folder(folder_id: str, token: str) -> List[Dict[str, Any]]:
     return get_json(f"{API_BASE}/folder/{folder_id}/list", auth_headers(token)).get("lists", [])
 
 # ---------- Task fetch ----------
-def fetch_list_tasks(token: str, list_id: str, include_closed=True, include_subtasks=True, limit=100) -> List[Dict[str, Any]]:
+def fetch_list_tasks(
+    token: str,
+    list_id: str,
+    include_closed: bool = True,
+    include_subtasks: bool = True,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
     headers = auth_headers(token)
     tasks, page = [], 0
     while True:
         params = {
-            "page": page, "limit": limit,
+            "page": page,
+            "limit": limit,
             "include_closed": str(include_closed).lower(),
             "subtasks": str(include_subtasks).lower(),
         }
@@ -112,38 +122,6 @@ def parse_folder_multi(title: str) -> List[Tuple[str, str]]:
 mc_re = re.compile(r"\b(?:MC\d{4}|MCA\d{3})\b", re.IGNORECASE)
 brd_re = re.compile(r"\b([SPZ]\d{5})\b", re.IGNORECASE)
 
-def find_all_brd(text: str) -> list[str]:
-    """Return ALL BRD codes (S#####/P#####/Z#####) in order of appearance, uppercased."""
-    if not text:
-        return []
-    return [m.group(1).upper() for m in brd_re.finditer(text)]
-
-def extract_brd_from_text(text: str) -> str:
-    if not text:
-        return ""
-    m = brd_re.search(text)
-    return m.group(1).upper() if m else ""
-
-def normalize_title(s: str) -> str:
-    return (s or "").strip().upper()
-
-def merge_latest_date(current_iso: str, new_ms) -> str:
-    """Keep later date (YYYY-MM-DD) given a ClickUp ms timestamp or None."""
-    if not new_ms:
-        return current_iso
-    try:
-        ts = pd.to_datetime(int(new_ms), unit="ms", utc=True).tz_convert(None).date()
-        new_iso = ts.isoformat()
-    except Exception:
-        return current_iso
-    if not current_iso:
-        return new_iso
-    return max(current_iso, new_iso)
-
-# Regex patterns
-mc_re = re.compile(r"\b(?:MC\d{4}|MCA\d{3})\b", re.IGNORECASE)
-brd_re = re.compile(r"\b([SPZ]\d{5})\b", re.IGNORECASE)
-
 def extract_mc_from_text(text: str) -> str:
     """Return the first MC#### or MCA### code in a given text string, or '' if none."""
     if not text:
@@ -151,33 +129,87 @@ def extract_mc_from_text(text: str) -> str:
     m = mc_re.search(text)
     return m.group(0).upper() if m else ""
 
-def find_all_brd(text: str) -> list[str]:
+def find_all_brd(text: str) -> List[str]:
     """Return ALL BRD codes (S#####/P#####/Z#####) in order of appearance, uppercased."""
     if not text:
         return []
     return [m.group(1).upper() for m in brd_re.finditer(text)]
 
+# ---------- Label detection (fuzzy but safe) ----------
+# Accept exact "RECORD DATE"/"MEETING DATE" OR titles that *start with* those labels,
+# while rejecting range-like titles (RANGE/WINDOW/TO/BETWEEN/FROM/THRU/THROUGH).
+RANGE_BLOCK = re.compile(r"^(?:[:\-–—\s]*)(RANGE|WINDOW|THRU|THROUGH|TO|BETWEEN|FROM)\b", re.IGNORECASE)
+RECORD_START = re.compile(r"^\s*RECORD\s*DATE\b(.*)$", re.IGNORECASE)
+MEETING_START = re.compile(r"^\s*MEETING\s*DATE\b(.*)$", re.IGNORECASE)
 
+def _is_single_label_task(text: str, kind: str) -> bool:
+    """
+    True if the title is exactly the label OR starts with it,
+    and the trailing part is not a range/window phrase.
+    """
+    if not text:
+        return False
+    t = (text or "").strip()
+    up = t.upper()
+
+    if kind == "record":
+        if up == "RECORD DATE":
+            return True
+        m = RECORD_START.match(t)
+    else:  # kind == "meeting"
+        if up == "MEETING DATE":
+            return True
+        m = MEETING_START.match(t)
+
+    if not m:
+        return False
+    tail = (m.group(1) or "").strip()
+    # ignore leading punctuation/spaces in the tail before checking blockers
+    tail = re.sub(r"^[\s:–—-]+", "", tail)
+    return not RANGE_BLOCK.match(tail)
+
+# ---------- Date helpers ----------
+def merge_latest_date(current_iso: str, new_ms) -> str:
+    """Keep later date (YYYY-MM-DD) given a ClickUp ms timestamp or None, in USER_TZ."""
+    if not new_ms:
+        return current_iso
+    try:
+        ms = int(new_ms)
+        new_iso = pd.to_datetime(ms, unit="ms", utc=True).tz_convert(USER_TZ).date().isoformat()
+    except Exception:
+        return current_iso
+    return max(current_iso, new_iso) if current_iso else new_iso
+
+def merge_latest_iso(current_iso: str, new_iso: Optional[str]) -> str:
+    if not new_iso:
+        return current_iso
+    if not current_iso:
+        return new_iso
+    return max(current_iso, new_iso)
+
+# ---------- Scan a folder for codes & dates ----------
 def scan_folder_metadata(folder_id: str, token: str) -> dict:
     """
     Single-pass scan of a folder to gather:
       - mc_code: first MC####/MCA### found (lists -> tasks -> CF strings)
       - brd_code: ALL S/P/Z + 5 digits found (lists -> tasks -> CF strings), joined by ", "
-      - record_date: latest due_date from tasks named 'RECORD DATE'
-      - meeting_date: latest due_date from tasks named 'MEETING DATE'
+      - record_date: latest due_date from tasks labeled 'RECORD DATE' (fuzzy start match; no ranges)
+      - meeting_date: latest due_date from tasks labeled 'MEETING DATE' (fuzzy start match; no ranges)
+    NOTE: We only use the task's due_date for dates (no title/CF parsing into dates).
     """
     meta = {"mc_code": "", "brd_code": "", "record_date": "", "meeting_date": ""}
 
     lists = get_lists_in_folder(folder_id, token)
 
     # Helper: append codes preserving first-seen order (no duplicates)
-    brd_accum: list[str] = []
-    seen = set()
-    def add_brd_codes(codes: list[str]):
-        nonlocal brd_accum, seen
+    brd_accum: List[str] = []
+    seen_codes = set()
+
+    def add_brd_codes(codes: List[str]):
+        nonlocal brd_accum, seen_codes
         for c in codes:
-            if c not in seen:
-                seen.add(c)
+            if c not in seen_codes:
+                seen_codes.add(c)
                 brd_accum.append(c)
 
     # Quick pass on list names
@@ -193,6 +225,7 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
     for l in lists:
         for t in fetch_list_tasks(token, str(l["id"]), include_closed=True, include_subtasks=True, limit=100):
             tname = t.get("name") or ""
+            due_ms = t.get("due_date")
 
             # MC first-hit only
             if not meta["mc_code"]:
@@ -203,14 +236,13 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
             # BRD: collect all occurrences
             add_brd_codes(find_all_brd(tname))
 
-            # Dates
-            title_norm = normalize_title(tname)
-            if title_norm == "RECORD DATE":
-                meta["record_date"] = merge_latest_date(meta["record_date"], t.get("due_date"))
-            elif title_norm == "MEETING DATE":
-                meta["meeting_date"] = merge_latest_date(meta["meeting_date"], t.get("due_date"))
+            # Dates: ONLY due_date when the title is a single-date RECORD/MEETING label
+            if due_ms and _is_single_label_task(tname, "record"):
+                meta["record_date"] = merge_latest_date(meta["record_date"], due_ms)
+            if due_ms and _is_single_label_task(tname, "meeting"):
+                meta["meeting_date"] = merge_latest_date(meta["meeting_date"], due_ms)
 
-            # String custom fields
+            # String custom fields → codes only (do not parse dates from CFs)
             for cf in (t.get("custom_fields") or []):
                 val = cf.get("value")
                 if isinstance(val, str):
@@ -222,9 +254,7 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
 
     # Join all BRD codes into a single cell
     meta["brd_code"] = ", ".join(brd_accum)
-
     return meta
-
 
 # ---------- Fixed-run button ----------
 if not token:
@@ -237,14 +267,20 @@ try:
     if run:
         with st.spinner("Resolving Workspace and Space…"):
             teams = get_workspaces(token)
-            ws = next((t for t in teams if (t.get("name") or "").strip().lower() == WORKSPACE_NAME.lower()), None)
+            ws = next(
+                (t for t in teams if (t.get("name") or "").strip().lower() == WORKSPACE_NAME.lower()),
+                None,
+            )
             if not ws:
                 st.error(f'Workspace "{WORKSPACE_NAME}" not found for this token.')
                 st.stop()
             team_id = str(ws["id"])
 
             spaces = get_spaces(team_id, token)
-            space = next((s for s in spaces if (s.get("name") or "").strip().lower() == SPACE_NAME.lower()), None)
+            space = next(
+                (s for s in spaces if (s.get("name") or "").strip().lower() == SPACE_NAME.lower()),
+                None,
+            )
             if not space:
                 st.error(f'Space "{SPACE_NAME}" not found in workspace "{WORKSPACE_NAME}".')
                 st.stop()
@@ -262,22 +298,24 @@ try:
                 meta = scan_folder_metadata(folder_id, token)
 
                 for job_num, job_name in jobs:
-                    rows.append({
-                        "Job Number": job_num,
-                        "Job Name": job_name,
-                        "Broadridge MC": meta["mc_code"],
-                        "BRD S or P Job Number": meta["brd_code"],
-                        "Record Date": meta["record_date"],
-                        "Meeting Date": meta["meeting_date"],
-                        "Folder ID": folder_id,
-                        "Folder Title": title,
-                    })
+                    rows.append(
+                        {
+                            "Job Number": job_num,
+                            "Job Name": job_name,
+                            "Broadridge MC": meta["mc_code"],
+                            "BRD S or P Job Number": meta["brd_code"],
+                            "Record Date": meta["record_date"],
+                            "Meeting Date": meta["meeting_date"],
+                            "Folder ID": folder_id,
+                            "Folder Title": title,
+                        }
+                    )
 
             df = pd.DataFrame(rows)
 
             # Remove placeholder rows (e.g. PROJECT LIST TEMPLATE)
             df = df[df["Job Name"].str.upper() != "PROJECT LIST TEMPLATE"]
-            
+
             df = df.sort_values(["Job Number", "Job Name"], na_position="last").reset_index(drop=True)
 
             # Shape final columns and convert dates to true date objects
