@@ -245,7 +245,12 @@ try:
                         "Folder Title": title,
                     })
 
-            df = pd.DataFrame(rows).sort_values(["Job Number", "Job Name"], na_position="last").reset_index(drop=True)
+            df = pd.DataFrame(rows)
+
+            # Remove placeholder rows (e.g. PROJECT LIST TEMPLATE)
+            df = df[df["Job Name"].str.upper() != "PROJECT LIST TEMPLATE"]
+            
+            df = df.sort_values(["Job Number", "Job Name"], na_position="last").reset_index(drop=True)
 
             # Shape final columns and convert dates to true date objects
             final_cols = [
