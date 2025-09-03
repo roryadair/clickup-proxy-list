@@ -140,6 +140,24 @@ def merge_latest_date(current_iso: str, new_ms) -> str:
         return new_iso
     return max(current_iso, new_iso)
 
+# Regex patterns
+mc_re = re.compile(r"\b(?:MC\d{4}|MCA\d{3})\b", re.IGNORECASE)
+brd_re = re.compile(r"\b([SPZ]\d{5})\b", re.IGNORECASE)
+
+def extract_mc_from_text(text: str) -> str:
+    """Return the first MC#### or MCA### code in a given text string, or '' if none."""
+    if not text:
+        return ""
+    m = mc_re.search(text)
+    return m.group(0).upper() if m else ""
+
+def find_all_brd(text: str) -> list[str]:
+    """Return ALL BRD codes (S#####/P#####/Z#####) in order of appearance, uppercased."""
+    if not text:
+        return []
+    return [m.group(1).upper() for m in brd_re.finditer(text)]
+
+
 def scan_folder_metadata(folder_id: str, token: str) -> dict:
     """
     Single-pass scan of a folder to gather:
