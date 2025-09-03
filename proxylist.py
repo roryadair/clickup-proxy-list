@@ -217,8 +217,10 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
     Single-pass scan of a folder to gather:
       - mc_code: first MC####/MCA### found (lists -> tasks -> CF strings)
       - brd_code: ALL S/P/Z + 5 digits found (lists -> tasks -> CF strings), joined by ", "
-      - record_date: latest date from tasks labelled like 'RECORD DATE' (prefer due_date, else parse title)
-      - meeting_date: latest date from tasks labelled like 'MEETING DATE' (prefer due_date, else parse title)
+      - record_date: latest task due_date among tasks whose title matches 'RECORD DATE'
+      - meeting_date: latest task due_date among tasks whose title matches 'MEETING DATE'
+
+    IMPORTANT: For Record/Meeting dates we ONLY look at task due_date. No title text parsing or CF parsing.
     """
     meta = {"mc_code": "", "brd_code": "", "record_date": "", "meeting_date": ""}
 
@@ -235,7 +237,7 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
                 seen_codes.add(c)
                 brd_accum.append(c)
 
-    # Quick pass on list names for codes
+    # Pass 1: list names (codes only)
     for l in lists:
         name = l.get("name") or ""
         if not meta["mc_code"]:
@@ -244,11 +246,11 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
                 meta["mc_code"] = mc
         add_brd_codes(find_all_brd(name))
 
-    # Tasks (names + string CFs) for codes and dates
+    # Pass 2: tasks (codes + due_date-only date capture)
     for l in lists:
         for t in fetch_list_tasks(token, str(l["id"]), include_closed=True, include_subtasks=True, limit=100):
             tname = t.get("name") or ""
-            due_ms = t.get("due_date")
+            due_ms = t.get("due_date")  # may be None
 
             # MC first-hit only
             if not meta["mc_code"]:
@@ -256,36 +258,17 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
                 if mc:
                     meta["mc_code"] = mc
 
-            # BRD: collect all occurrences from title
+            # BRD codes from task name
             add_brd_codes(find_all_brd(tname))
 
-            # ---- RECORD DATE: prefer due_date, else parse from title ----
-            if label_in_text("record_date", tname):
-                if due_ms:
-                    meta["record_date"] = merge_latest_date(meta["record_date"], due_ms)
-                else:
-                    # 1) Try text after the label
-                    tail = extract_trailing_after_label("record_date", tname)
-                    iso = _parse_iso_from_text(tail)
-                    # 2) Fallback: fuzzy-parse anywhere in the title
-                    if not iso:
-                        iso = _parse_iso_from_text(tname)
-                    meta["record_date"] = merge_latest_iso(meta["record_date"], iso)
+            # ----- DATES: ONLY due_date when label is in the task title -----
+            if label_in_text("record_date", tname) and due_ms:
+                meta["record_date"] = merge_latest_date(meta["record_date"], due_ms)
 
-            # ---- MEETING DATE: prefer due_date, else parse from title ----
-            if label_in_text("meeting_date", tname):
-                if due_ms:
-                    meta["meeting_date"] = merge_latest_date(meta["meeting_date"], due_ms)
-                else:
-                    # 1) Try text after the label
-                    tail = extract_trailing_after_label("meeting_date", tname)
-                    iso = _parse_iso_from_text(tail)
-                    # 2) Fallback: fuzzy-parse anywhere in the title
-                    if not iso:
-                        iso = _parse_iso_from_text(tname)
-                    meta["meeting_date"] = merge_latest_iso(meta["meeting_date"], iso)
+            if label_in_text("meeting_date", tname) and due_ms:
+                meta["meeting_date"] = merge_latest_date(meta["meeting_date"], due_ms)
 
-            # String custom fields: still scan for codes only (NOT dates)
+            # Custom fields: use ONLY for codes (no date capture from CFs)
             for cf in (t.get("custom_fields") or []):
                 val = cf.get("value")
                 if isinstance(val, str):
