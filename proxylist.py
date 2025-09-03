@@ -163,6 +163,59 @@ def _is_single_label_task(text: str, kind: str) -> bool:
     tail = re.sub(r"^[\s:–—-]+", "", tail)
     return not RANGE_BLOCK.match(tail)
 
+# --- Exact label matchers ---
+EXACT_RECORD = re.compile(r"^\s*RECORD\s*DATE\s*$", re.IGNORECASE)
+EXACT_MEETING = re.compile(r"^\s*MEETING\s*DATE\s*$", re.IGNORECASE)
+
+def is_exact_label(title: str, kind: str) -> bool:
+    if not title:
+        return False
+    return bool((EXACT_RECORD if kind == "record" else EXACT_MEETING).match(title))
+
+# --- Strict fuzzy matcher (keeps your existing logic & blockers) ---
+BLOCKERS_ANY = re.compile(r"\b(RANGE|WINDOW|THRU|THROUGH|TO|BETWEEN|FROM)\b", re.IGNORECASE)
+BAD_TAIL_WORDS = re.compile(
+    r"\b(FILE|FILES|DOCS?|PDF|UPLOAD|LINK|DRAFT|CHECKLIST|NOTE|NOTES|TEMPLATE|PACKAGE|PKG|MATERIALS?|SUBMISSION|REPORT|STATUS|EMAIL)\b",
+    re.IGNORECASE,
+)
+RECORD_ANY = re.compile(r"\bRECORD\s*DATE\b", re.IGNORECASE)
+MEETING_ANY = re.compile(r"\bMEETING\s*DATE\b", re.IGNORECASE)
+_SEP_STRIP = re.compile(r"^[\s:–—-]+")
+
+def is_label_task_strict(title: str, kind: str) -> bool:
+    """
+    Accept ONLY:
+      - exact 'RECORD DATE' / 'MEETING DATE', OR
+      - label anywhere, followed by separators and a date-ish or placeholder tail.
+    Reject range/window/admin-helper titles.
+    """
+    if not title or BLOCKERS_ANY.search(title):
+        return False
+    if is_exact_label(title, kind):
+        return True
+
+    pat = RECORD_ANY if kind == "record" else MEETING_ANY
+    m = pat.search(title)
+    if not m:
+        return False
+
+    tail = _SEP_STRIP.sub("", (title[m.end():] or "")).strip()
+    if tail == "":
+        return True  # effectively exact after trailing whitespace/separators
+
+    if BAD_TAIL_WORDS.search(tail):
+        return False
+
+    ts = pd.to_datetime(tail, errors="coerce")
+    if not pd.isna(ts):
+        return True
+
+    if re.fullmatch(r"(TBD|TBA|N/?A|ASAP)", tail, re.IGNORECASE):
+        return True
+
+    return False
+
+
 # --- Stricter label matcher to ignore helper/admin tasks like "Record Date Date File" ---
 
 # Words that mean this isn't a single-day date task
@@ -270,9 +323,9 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
     Single-pass scan of a folder to gather:
       - mc_code: first MC####/MCA### found (lists -> tasks -> CF strings)
       - brd_code: ALL S/P/Z + 5 digits found (lists -> tasks -> CF strings), joined by ", "
-      - record_date: chosen from due_date of 'RECORD DATE...' tasks (fuzzy start; no ranges)
-      - meeting_date: chosen from due_date of 'MEETING DATE...' tasks (fuzzy start; no ranges)
-    We only use due_date; no title/CF date parsing.
+      - record_date / meeting_date: chosen from due_date of label tasks
+        * PRIORITY: exact 'RECORD DATE'/'MEETING DATE' tasks first; if none, use strict fuzzy
+      We only use due_date; no title/CF date parsing.
     """
     meta = {"mc_code": "", "brd_code": "", "record_date": "", "meeting_date": ""}
 
@@ -298,38 +351,19 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
                 meta["mc_code"] = mc
         add_brd_codes(find_all_brd(lname))
 
-    # Collect candidate dates
-    rec_candidates: List[Tuple[str, bool]] = []
-    mtg_candidates: List[Tuple[str, bool]] = []
+    # Collect candidates (split into EXACT vs FUZZY buckets)
+    rec_exact:   List[Tuple[str, bool]] = []
+    rec_fuzzy:   List[Tuple[str, bool]] = []
+    mtg_exact:   List[Tuple[str, bool]] = []
+    mtg_fuzzy:   List[Tuple[str, bool]] = []
 
-    # Tasks (names + string CFs) for codes and dates
     for l in lists:
         for t in fetch_list_tasks(token, str(l["id"]), include_closed=True, include_subtasks=True, limit=100):
             tname = t.get("name") or ""
             due_ms = t.get("due_date")
 
-            # MC first-hit only
-            if not meta["mc_code"]:
-                mc = extract_mc_from_text(tname)
-                if mc:
-                    meta["mc_code"] = mc
-
-            # BRD: collect all occurrences
+            # Codes
             add_brd_codes(find_all_brd(tname))
-
-            # Date candidates (ONLY due_date)
-            if due_ms and is_label_task_strict(tname, "record"):
-                iso = iso_from_ms(due_ms)
-                if iso:
-                    rec_candidates.append((iso, status_is_open(t)))
-            
-            if due_ms and is_label_task_strict(tname, "meeting"):
-                iso = iso_from_ms(due_ms)
-                if iso:
-                    mtg_candidates.append((iso, status_is_open(t)))
-
-
-            # CF strings → codes only
             for cf in (t.get("custom_fields") or []):
                 val = cf.get("value")
                 if isinstance(val, str):
@@ -339,13 +373,34 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
                             meta["mc_code"] = mc
                     add_brd_codes(find_all_brd(val))
 
-    # Pick the best dates per strategy
-    meta["record_date"] = pick_best_iso(rec_candidates)
-    meta["meeting_date"] = pick_best_iso(mtg_candidates)
+            # Dates (ONLY due_date)
+            if not due_ms:
+                continue
+            iso = iso_from_ms(due_ms)
+            if not iso:
+                continue
+            is_open = status_is_open(t)
+
+            # RECORD
+            if is_exact_label(tname, "record"):
+                rec_exact.append((iso, is_open))
+            elif is_label_task_strict(tname, "record"):
+                rec_fuzzy.append((iso, is_open))
+
+            # MEETING
+            if is_exact_label(tname, "meeting"):
+                mtg_exact.append((iso, is_open))
+            elif is_label_task_strict(tname, "meeting"):
+                mtg_fuzzy.append((iso, is_open))
+
+    # Pick exact first; only if none exist do we use fuzzy
+    meta["record_date"]  = pick_best_iso(rec_exact) or pick_best_iso(rec_fuzzy)
+    meta["meeting_date"] = pick_best_iso(mtg_exact) or pick_best_iso(mtg_fuzzy)
 
     # Join all BRD codes into a single cell
     meta["brd_code"] = ", ".join(brd_accum)
     return meta
+
 
 # ---------- Fixed-run button ----------
 if not token:
