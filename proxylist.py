@@ -163,6 +163,64 @@ def _is_single_label_task(text: str, kind: str) -> bool:
     tail = re.sub(r"^[\s:–—-]+", "", tail)
     return not RANGE_BLOCK.match(tail)
 
+# --- Stricter label matcher to ignore helper/admin tasks like "Record Date Date File" ---
+
+# Words that mean this isn't a single-day date task
+BLOCKERS_ANY = re.compile(r"\b(RANGE|WINDOW|THRU|THROUGH|TO|BETWEEN|FROM)\b", re.IGNORECASE)
+
+# Tails that clearly indicate files/admin (not a date)
+BAD_TAIL_WORDS = re.compile(
+    r"\b(FILE|FILES|DOCS?|PDF|UPLOAD|LINK|DRAFT|CHECKLIST|NOTE|NOTES|TEMPLATE|PACKAGE|PKG|MATERIALS?|SUBMISSION|REPORT|STATUS|EMAIL)\b",
+    re.IGNORECASE,
+)
+
+RECORD_ANY = re.compile(r"\bRECORD\s*DATE\b", re.IGNORECASE)
+MEETING_ANY = re.compile(r"\bMEETING\s*DATE\b", re.IGNORECASE)
+
+# Strip leading separators right after the label (":", "-", "—", whitespace)
+_SEP_STRIP = re.compile(r"^[\s:–—-]+")
+
+def is_label_task_strict(title: str, kind: str) -> bool:
+    """
+    Accept ONLY:
+      - exact 'RECORD DATE' / 'MEETING DATE'
+      - OR label followed by separators and a date-ish tail
+    Reject if the title/tail looks like a range/window or a file/admin helper.
+    """
+    if not title:
+        return False
+
+    if BLOCKERS_ANY.search(title):
+        return False
+
+    pat = RECORD_ANY if kind == "record" else MEETING_ANY
+    m = pat.search(title)
+    if not m:
+        return False
+
+    tail = _SEP_STRIP.sub("", (title[m.end():] or "")).strip()
+
+    # Exact label (no tail) → OK
+    if tail == "":
+        return True
+
+    # Tails that look like artifacts/admin → reject
+    if BAD_TAIL_WORDS.search(tail):
+        return False
+
+    # If tail parses as a date, also OK (we still only use due_date — this just validates the label)
+    ts = pd.to_datetime(tail, errors="coerce")
+    if not pd.isna(ts):
+        return True
+
+    # Allow common placeholders
+    if re.fullmatch(r"(TBD|TBA|N/?A|ASAP)", tail, re.IGNORECASE):
+        return True
+
+    # Anything else (e.g., "Date File") → reject
+    return False
+
+
 # ---------- Date helpers ----------
 def iso_from_ms(ms: Any) -> Optional[str]:
     try:
@@ -260,15 +318,16 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
             add_brd_codes(find_all_brd(tname))
 
             # Date candidates (ONLY due_date)
-            if due_ms and _is_single_label_task(tname, "record"):
+            if due_ms and is_label_task_strict(tname, "record"):
                 iso = iso_from_ms(due_ms)
                 if iso:
                     rec_candidates.append((iso, status_is_open(t)))
-
-            if due_ms and _is_single_label_task(tname, "meeting"):
+            
+            if due_ms and is_label_task_strict(tname, "meeting"):
                 iso = iso_from_ms(due_ms)
                 if iso:
                     mtg_candidates.append((iso, status_is_open(t)))
+
 
             # CF strings → codes only
             for cf in (t.get("custom_fields") or []):
