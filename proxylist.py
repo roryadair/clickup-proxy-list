@@ -135,6 +135,35 @@ def find_all_brd(text: str) -> List[str]:
         return []
     return [m.group(1).upper() for m in brd_re.finditer(text)]
 
+def cf_value_to_text(val: Any) -> str:
+    """Best-effort stringify for ClickUp CF values (text, dropdown objects, lists, etc.)."""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, (int, float)):
+        return str(val)
+    if isinstance(val, dict):
+        for k in ("label", "name", "value", "title", "text"):
+            v = val.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        parts = [str(v) for v in val.values() if isinstance(v, (str, int, float)) and str(v).strip()]
+        return " ".join(parts)
+    if isinstance(val, list):
+        parts = []
+        for item in val:
+            if isinstance(item, (str, int, float)):
+                parts.append(str(item))
+            elif isinstance(item, dict):
+                for k in ("label", "name", "value", "title", "text"):
+                    v = item.get(k)
+                    if isinstance(v, str) and v.strip():
+                        parts.append(v); break
+        return " ".join(parts)
+    return str(val)
+
+
 # ---------- Label detection (fuzzy but safe) ----------
 # Accept exact labels or titles that START with the label (e.g., "RECORD DATE: ..."),
 # while rejecting range-like titles ("RANGE", "WINDOW", "TO", etc.).
@@ -317,6 +346,45 @@ def status_is_open(t: Dict[str, Any]) -> bool:
     # ClickUp uses status.type in {"open","closed"}; default to True if missing
     return (stobj.get("type") or "open").lower() != "closed"
 
+def cf_value_to_text(val: Any) -> str:
+    """Best-effort stringify for ClickUp CF values (text, dropdown objects, lists, etc.)."""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, (int, float)):
+        return str(val)
+
+    if isinstance(val, dict):
+        # Try common label/name keys first
+        for k in ("label", "name", "value", "title", "text"):
+            v = val.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        # Fallback: join simple values
+        parts = []
+        for v in val.values():
+            if isinstance(v, (str, int, float)) and str(v).strip():
+                parts.append(str(v))
+        return " ".join(parts)
+
+    if isinstance(val, list):
+        parts = []
+        for item in val:
+            if isinstance(item, (str, int, float)):
+                parts.append(str(item))
+            elif isinstance(item, dict):
+                for k in ("label", "name", "value", "title", "text"):
+                    v = item.get(k)
+                    if isinstance(v, str) and v.strip():
+                        parts.append(v)
+                        break
+        return " ".join(parts)
+
+    # Last resort
+    return str(val)
+
+
 # ---------- Scan a folder for codes & dates ----------
 def scan_folder_metadata(folder_id: str, token: str) -> dict:
     """
@@ -363,15 +431,27 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
             due_ms = t.get("due_date")
 
             # Codes
+            # ----- CODES from task TITLE -----
+            # MC: first-hit only from the task name
+            if not meta["mc_code"]:
+                mc = extract_mc_from_text(tname)
+                if mc:
+                    meta["mc_code"] = mc
+            
+            # BRD: collect all occurrences from the task name
             add_brd_codes(find_all_brd(tname))
+            
+            # ----- CODES from custom fields (handle text, dropdowns, lists, etc.) -----
             for cf in (t.get("custom_fields") or []):
-                val = cf.get("value")
-                if isinstance(val, str):
-                    if not meta["mc_code"]:
-                        mc = extract_mc_from_text(val)
-                        if mc:
-                            meta["mc_code"] = mc
-                    add_brd_codes(find_all_brd(val))
+                text = cf_value_to_text(cf.get("value"))
+                if not text:
+                    continue
+                if not meta["mc_code"]:
+                    mc = extract_mc_from_text(text)
+                    if mc:
+                        meta["mc_code"] = mc
+                add_brd_codes(find_all_brd(text))
+
 
             # Dates (ONLY due_date)
             if not due_ms:
