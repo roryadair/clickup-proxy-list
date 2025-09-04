@@ -580,9 +580,27 @@ try:
             rank = mdt.copy()
             rank[mdt.notna() & (mdt < today)] = pd.Timestamp.max - mdt[mdt.notna() & (mdt < today)]
             
-            by_mtg = out_df.assign(_grp=grp, _rank=rank).sort_values(
-                ["_grp", "_rank"], ascending=[True, True], na_position="last"
-            ).drop(columns=["_grp", "_rank"])
+            # Build sorted views
+            by_client = out_df.sort_values(["Job Name", "Job Number"], na_position="last")
+            
+            # Robust future-first ordering for Meeting Date
+            mdt = pd.to_datetime(out_df["Meeting Date"], errors="coerce")
+            today = pd.Timestamp.now(tz=USER_TZ).normalize()
+            
+            fut_mask   = mdt.notna() & (mdt >= today)
+            past_mask  = mdt.notna() & (mdt <  today)
+            blank_mask = mdt.isna()
+            
+            # Sort each group independently, then stack
+            fut   = out_df.loc[fut_mask].sort_values(
+                "Meeting Date", key=lambda s: pd.to_datetime(s, errors="coerce"), ascending=True
+            )
+            past  = out_df.loc[past_mask].sort_values(
+                "Meeting Date", key=lambda s: pd.to_datetime(s, errors="coerce"), ascending=False
+            )
+            blank = out_df.loc[blank_mask]
+            
+            by_mtg = pd.concat([fut, past, blank], ignore_index=True)
 
             
             # Helper to format a sheet (freeze header, filters, widths, number formats)
