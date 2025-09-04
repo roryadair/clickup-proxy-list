@@ -562,30 +562,12 @@ try:
 
             # Build sorted views
             by_client = out_df.sort_values(["Job Name", "Job Number"], na_position="last")
-            # Build sorted views
-            by_client = out_df.sort_values(["Job Name", "Job Number"], na_position="last")
             
-            # Future-first sorting for Meeting Date:
+            # Robust future-first ordering for Meeting Date (future → past → blanks)
             mdt = pd.to_datetime(out_df["Meeting Date"], errors="coerce")
+            
+            # Make 'today' tz-naive (matches mdt which is tz-naive)
             today = pd.Timestamp(pd.Timestamp.now(tz=USER_TZ).date())
-            
-            # Group order: 0 = future, 1 = past, 2 = blank/NaT (last)
-            grp = pd.Series(2, index=out_df.index)
-            grp[mdt.notna() & (mdt >= today)] = 0
-            grp[mdt.notna() & (mdt <  today)] = 1
-            
-            # Rank within group:
-            # - future: ascending by date (soonest first)
-            # - past: descending by date (most recent past first)
-            rank = mdt.copy()
-            rank[mdt.notna() & (mdt < today)] = pd.Timestamp.max - mdt[mdt.notna() & (mdt < today)]
-            
-            # Build sorted views
-            by_client = out_df.sort_values(["Job Name", "Job Number"], na_position="last")
-            
-            # Robust future-first ordering for Meeting Date
-            mdt = pd.to_datetime(out_df["Meeting Date"], errors="coerce")
-            today = pd.Timestamp.now(tz=USER_TZ).normalize()
             
             fut_mask   = mdt.notna() & (mdt >= today)
             past_mask  = mdt.notna() & (mdt <  today)
