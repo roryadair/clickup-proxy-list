@@ -119,7 +119,7 @@ def parse_folder_multi(title: str) -> List[Tuple[str, str]]:
     return [(n, job_name) for n in nums]
 
 # Codes inside folder contents
-mc_re = re.compile(r"\b(?:MC\d{4}|MCA\d{3})\b", re.IGNORECASE)
+mc_re = re.compile(r"\b(?:MC\s?\d{4}|MCA\d{3})\b", re.IGNORECASE)
 brd_re = re.compile(r"\b([SPZ]\d{5})\b", re.IGNORECASE)
 
 def extract_mc_from_text(text: str) -> str:
