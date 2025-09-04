@@ -7,6 +7,13 @@ import pandas as pd
 import requests
 import streamlit as st
 
+# PDF export (install: pip install fpdf2)
+try:
+    from fpdf import FPDF
+    HAS_FPDF = True
+except Exception:
+    HAS_FPDF = False
+
 API_BASE = "https://api.clickup.com/api/v2"
 USER_TZ = "America/Los_Angeles"  # Convert ClickUp UTC ms → this TZ → date
 
@@ -630,6 +637,67 @@ try:
                 # Format both sheets
                 _format_sheet(xw.book["By Client Name"])
                 _format_sheet(xw.book["By Meeting Date"])
+
+            def _fit_text(pdf: "FPDF", text: str, cell_w_mm: float) -> str:
+                """Truncate text with … to fit into a cell width."""
+                text = "" if text is None else str(text)
+                ell = "…"
+                # Leave a tiny padding so borders look clean
+                max_w = max(0, cell_w_mm - 1.5)
+                if pdf.get_string_width(text) <= max_w:
+                    return text
+                while text and pdf.get_string_width(text + ell) > max_w:
+                    text = text[:-1]
+                return (text + ell) if text else ""
+            
+            def _add_df_sheet_to_pdf(pdf: "FPDF", df: pd.DataFrame, title: str) -> None:
+                """Add one sheet to the PDF, starting on a new page, with an auto-sized table."""
+                # Start page + title
+                pdf.add_page(orientation="L")  # Landscape for wider tables
+                pdf.set_font("Helvetica", "B", 14)
+                pdf.cell(0, 9, title, ln=1)
+                pdf.ln(1)
+            
+                # Copy and format dates as strings for stable rendering
+                df = df.copy()
+                for col in ["Record Date", "Meeting Date"]:
+                    if col in df.columns:
+                        df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%Y-%m-%d")
+                df = df.fillna("")
+            
+                # Compute column widths (based on 90th percentile text length, clamped)
+                pdf.set_font("Helvetica", "", 8)
+                page_w = pdf.w - 2 * pdf.l_margin
+                cols = list(df.columns)
+            
+                # Sample up to 200 rows to estimate widths
+                sample = df.head(200).astype(str)
+                char_scores = []
+                for c in cols:
+                    lengths = sample[c].str.len()
+                    score = max(len(str(c)), int(lengths.quantile(0.90)))  # header vs 90th pct
+                    score = max(6, min(score, 30))  # clamp per-column weight
+                    char_scores.append(score)
+            
+                total = sum(char_scores) or 1
+                widths = [page_w * (s / total) for s in char_scores]
+                row_h = 6
+            
+                # Header
+                pdf.set_font("Helvetica", "B", 9)
+                for w, col in zip(widths, cols):
+                    pdf.cell(w, row_h, _fit_text(pdf, str(col), w), border=1)
+                pdf.ln(row_h)
+            
+                # Body
+                pdf.set_font("Helvetica", "", 8)
+                for _, r in df.iterrows():
+                    # Auto page-break handled by FPDF; just keep writing rows
+                    for w, col in zip(widths, cols):
+                        val = r[col]
+                        pdf.cell(w, row_h, _fit_text(pdf, "" if pd.isna(val) else str(val), w), border=1)
+                    pdf.ln(row_h)
+
             
             # After writing both sheets and formatting:
             buf.seek(0)
@@ -643,6 +711,32 @@ try:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
+
+            # --- PDF download (2 pages: By Client Name, By Meeting Date) ---
+            if HAS_FPDF:
+                pdf = FPDF(unit="mm", format="A4")
+                pdf.set_auto_page_break(auto=True, margin=10)
+            
+                # Make sure we only include the columns the user expects
+                pdf_cols = ["Job Number", "Job Name", "Broadridge MC", "BRD S or P Job Number", "Record Date", "Meeting Date"]
+                by_client_pdf = by_client.reindex(columns=pdf_cols)
+                by_mtg_pdf    = by_mtg.reindex(columns=pdf_cols)
+            
+                _add_df_sheet_to_pdf(pdf, by_client_pdf, "By Client Name")
+                _add_df_sheet_to_pdf(pdf, by_mtg_pdf, "By Meeting Date")
+            
+                # Get bytes and offer as download
+                pdf_bytes = pdf.output(dest="S").encode("latin-1")
+                st.download_button(
+                    "Download ACTIVE_Proxy_Jobs.pdf",
+                    data=pdf_bytes,
+                    file_name="ACTIVE_Proxy_Jobs.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            else:
+                st.info("To enable PDF download, add **fpdf2** to your environment (e.g., requirements.txt: `fpdf2`).")
+
 
 
             st.divider()
