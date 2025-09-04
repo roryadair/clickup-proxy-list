@@ -560,20 +560,79 @@ try:
             # Cast Job Number to numeric (drop non-numeric safely)
             out_df["Job Number"] = pd.to_numeric(out_df["Job Number"], errors="coerce").astype("Int64")
 
-            # Write Excel to memory
+            # Build sorted views
+            by_client = out_df.sort_values(["Job Name", "Job Number"], na_position="last")
+            # Build sorted views
+            by_client = out_df.sort_values(["Job Name", "Job Number"], na_position="last")
+            
+            # Future-first sorting for Meeting Date:
+            mdt = pd.to_datetime(out_df["Meeting Date"], errors="coerce")
+            today = pd.Timestamp(pd.Timestamp.now(tz=USER_TZ).date())
+            
+            # Group order: 0 = future, 1 = past, 2 = blank/NaT (last)
+            grp = pd.Series(2, index=out_df.index)
+            grp[mdt.notna() & (mdt >= today)] = 0
+            grp[mdt.notna() & (mdt <  today)] = 1
+            
+            # Rank within group:
+            # - future: ascending by date (soonest first)
+            # - past: descending by date (most recent past first)
+            rank = mdt.copy()
+            rank[mdt.notna() & (mdt < today)] = pd.Timestamp.max - mdt[mdt.notna() & (mdt < today)]
+            
+            by_mtg = out_df.assign(_grp=grp, _rank=rank).sort_values(
+                ["_grp", "_rank"], ascending=[True, True], na_position="last"
+            ).drop(columns=["_grp", "_rank"])
+
+            
+            # Helper to format a sheet (freeze header, filters, widths, number formats)
+            def _format_sheet(ws):
+                from openpyxl.utils import get_column_letter
+            
+                # Freeze header row
+                ws.freeze_panes = "A2"
+            
+                # AutoFilter full used range
+                max_col, max_row = ws.max_column, ws.max_row
+                ws.auto_filter.ref = f"A1:{ws.cell(row=1, column=max_col).column_letter}{max_row}"
+            
+                # Header index
+                header_idx = {cell.value: cell.column for cell in ws[1] if cell.value}
+            
+                # Number formats
+                if "Job Number" in header_idx:
+                    col_letter = ws.cell(row=1, column=header_idx["Job Number"]).column_letter
+                    for r in range(2, max_row + 1):
+                        ws[f"{col_letter}{r}"].number_format = "0"
+                for col_name in ["Record Date", "Meeting Date"]:
+                    if col_name in header_idx:
+                        col_letter = ws.cell(row=1, column=header_idx[col_name]).column_letter
+                        for r in range(2, max_row + 1):
+                            ws[f"{col_letter}{r}"].number_format = "yyyy-mm-dd"
+            
+                # Auto-size columns
+                for c in range(1, max_col + 1):
+                    letter = get_column_letter(c)
+                    max_len = 0
+                    for r in range(1, max_row + 1):
+                        v = ws[f"{letter}{r}"].value
+                        v = "" if v is None else str(v)
+                        if len(v) > max_len:
+                            max_len = len(v)
+                    ws.column_dimensions[letter].width = min(max(10, max_len + 2), 60)
+            
+            # Write Excel with two tabs
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl", date_format="YYYY-MM-DD") as xw:
-                out_df.to_excel(xw, index=False, sheet_name="Jobs")
+                by_client.to_excel(xw, index=False, sheet_name="By Client Name")
+                by_mtg.to_excel(xw, index=False, sheet_name="By Meeting Date")
+            
+                # Format both sheets
+                _format_sheet(xw.book["By Client Name"])
+                _format_sheet(xw.book["By Meeting Date"])
+            
             buf.seek(0)
 
-            st.success(f"Built {len(out_df)} rows from '{WORKSPACE_NAME}' → '{SPACE_NAME}'.")
-            st.download_button(
-                "Download ACTIVE_Proxy_Jobs.xlsx",
-                data=buf.getvalue(),
-                file_name="ACTIVE_Proxy_Jobs.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
 
             st.divider()
             st.subheader("Preview")
