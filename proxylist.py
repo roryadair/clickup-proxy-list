@@ -717,7 +717,6 @@ try:
                 pdf = FPDF(unit="mm", format="A4")
                 pdf.set_auto_page_break(auto=True, margin=10)
             
-                # Make sure we only include the columns the user expects
                 pdf_cols = ["Job Number", "Job Name", "Broadridge MC", "BRD S or P Job Number", "Record Date", "Meeting Date"]
                 by_client_pdf = by_client.reindex(columns=pdf_cols)
                 by_mtg_pdf    = by_mtg.reindex(columns=pdf_cols)
@@ -725,8 +724,13 @@ try:
                 _add_df_sheet_to_pdf(pdf, by_client_pdf, "By Client Name")
                 _add_df_sheet_to_pdf(pdf, by_mtg_pdf, "By Meeting Date")
             
-                # Get bytes and offer as download
-                pdf_bytes = pdf.output(dest="S").encode("latin-1")
+                # ✅ Robust bytes handling across fpdf versions
+                pdf_buf = pdf.output(dest="S")  # bytes/bytearray/str depending on lib
+                if isinstance(pdf_buf, str):
+                    pdf_bytes = pdf_buf.encode("latin-1")
+                else:
+                    pdf_bytes = bytes(pdf_buf)
+            
                 st.download_button(
                     "Download ACTIVE_Proxy_Jobs.pdf",
                     data=pdf_bytes,
@@ -736,7 +740,6 @@ try:
                 )
             else:
                 st.info("To enable PDF download, add **fpdf2** to your environment (e.g., requirements.txt: `fpdf2`).")
-
 
 
             st.divider()
