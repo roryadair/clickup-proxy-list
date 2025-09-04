@@ -631,7 +631,18 @@ try:
                 _format_sheet(xw.book["By Client Name"])
                 _format_sheet(xw.book["By Meeting Date"])
             
+            # After writing both sheets and formatting:
             buf.seek(0)
+            
+            # ✅ Restore success message + download button
+            st.success(f"Built {len(out_df)} rows from '{WORKSPACE_NAME}' → '{SPACE_NAME}'.")
+            st.download_button(
+                "Download ACTIVE_Proxy_Jobs.xlsx",
+                data=buf.getvalue(),
+                file_name="ACTIVE_Proxy_Jobs.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
 
             st.divider()
