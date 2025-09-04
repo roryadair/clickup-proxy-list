@@ -557,6 +557,8 @@ try:
             for col in ["Record Date", "Meeting Date"]:
                 out_df[col] = pd.to_datetime(out_df[col], errors="coerce").dt.date
             out_df = out_df.where(pd.notnull(out_df), "")
+            # Cast Job Number to numeric (drop non-numeric safely)
+            out_df["Job Number"] = pd.to_numeric(out_df["Job Number"], errors="coerce").astype("Int64")
 
             # Write Excel to memory
             buf = io.BytesIO()
