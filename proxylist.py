@@ -25,7 +25,8 @@ SPACE_NAME = "ACTIVE Proxy Efforts"
 st.set_page_config(page_title="ACTIVE Proxy Jobs Export", page_icon="📊")
 st.title("ACTIVE Proxy Jobs Export")
 st.caption(
-    "Exports a 6-column Excel from ClickUp → Job Number, Job Name, Broadridge MC, BRD S/P/Z Job Number, Record Date, Meeting Date."
+    "Exports a 7-column Excel from ClickUp → Job Number, Job Name, Broadridge MC, "
+    "BRD S/P/Z Job Number, Record Date, Meeting Date, Adjournment Date."
 )
 
 # Always read token from Streamlit Secrets
@@ -67,19 +68,13 @@ def get_lists_in_folder(folder_id: str, token: str) -> List[Dict[str, Any]]:
     return get_json(f"{API_BASE}/folder/{folder_id}/list", auth_headers(token)).get("lists", [])
 
 # ---------- Task fetch ----------
-def fetch_list_tasks(
-    token: str,
-    list_id: str,
-    include_closed: bool = True,
-    include_subtasks: bool = True,
-    limit: int = 100,
-) -> List[Dict[str, Any]]:
+def fetch_list_tasks(token: str, list_id: str,
+    include_closed: bool = True, include_subtasks: bool = True, limit: int = 100) -> List[Dict[str, Any]]:
     headers = auth_headers(token)
     tasks, page = [], 0
     while True:
         params = {
-            "page": page,
-            "limit": limit,
+            "page": page, "limit": limit,
             "include_closed": str(include_closed).lower(),
             "subtasks": str(include_subtasks).lower(),
         }
@@ -92,7 +87,6 @@ def fetch_list_tasks(
     return tasks
 
 # ---------- Parsing helpers ----------
-# Folder title → Job numbers + Job name
 base_re = re.compile(r"^\s*(\d{6})(.*)$")
 dash_suffix_re = re.compile(r"-\s*(\d{3})")
 comma_full_re = re.compile(r",\s*(\d{6})")
@@ -100,7 +94,6 @@ name_after_paren_re = re.compile(r"\([^)]+\)\s*(.*)$")
 trailing_paren_number_re = re.compile(r"\(\d+\)\s*$")
 
 def parse_folder_multi(title: str) -> List[Tuple[str, str]]:
-    """Return list of (job_number, job_name) rows based on folder title rules."""
     if not title:
         return []
     t = title.strip()
@@ -109,644 +102,210 @@ def parse_folder_multi(title: str) -> List[Tuple[str, str]]:
         return [("", t)]
     base_num = m.group(1)
     remainder = m.group(2)
-
     comma_nums = comma_full_re.findall(remainder)
     prefix = base_num[:3]
     dash_full = [prefix + s for s in dash_suffix_re.findall(remainder)]
-
     seen, nums = set(), []
     for n in [base_num, *comma_nums, *dash_full]:
         if n not in seen:
             seen.add(n)
             nums.append(n)
-
     nm_match = name_after_paren_re.search(t)
     job_name = nm_match.group(1).strip() if nm_match else t
     job_name = trailing_paren_number_re.sub("", job_name).strip()
     return [(n, job_name) for n in nums]
 
-# Codes inside folder contents
+# ---------- Code detection ----------
 mc_re = re.compile(r"\b(?:MC\s?\d{4}|MCA\d{3})\b", re.IGNORECASE)
 brd_re = re.compile(r"\b([SPZ]\d{5})\b", re.IGNORECASE)
 
 def extract_mc_from_text(text: str) -> str:
-    """Return the first MC#### or MCA### code in a given text string, or '' if none."""
-    if not text:
-        return ""
+    if not text: return ""
     m = mc_re.search(text)
     return m.group(0).upper() if m else ""
 
 def find_all_brd(text: str) -> List[str]:
-    """Return ALL BRD codes (S#####/P#####/Z#####) in order of appearance, uppercased."""
-    if not text:
-        return []
+    if not text: return []
     return [m.group(1).upper() for m in brd_re.finditer(text)]
 
 def cf_value_to_text(val: Any) -> str:
-    """Best-effort stringify for ClickUp CF values (text, dropdown objects, lists, etc.)."""
-    if val is None:
-        return ""
-    if isinstance(val, str):
-        return val
-    if isinstance(val, (int, float)):
-        return str(val)
+    if val is None: return ""
+    if isinstance(val, str): return val
+    if isinstance(val, (int, float)): return str(val)
     if isinstance(val, dict):
-        for k in ("label", "name", "value", "title", "text"):
+        for k in ("label","name","value","title","text"):
             v = val.get(k)
-            if isinstance(v, str) and v.strip():
-                return v
-        parts = [str(v) for v in val.values() if isinstance(v, (str, int, float)) and str(v).strip()]
-        return " ".join(parts)
+            if isinstance(v,str) and v.strip(): return v
+        return " ".join(str(v) for v in val.values() if isinstance(v,(str,int,float)) and str(v).strip())
     if isinstance(val, list):
-        parts = []
+        parts=[]
         for item in val:
-            if isinstance(item, (str, int, float)):
-                parts.append(str(item))
-            elif isinstance(item, dict):
-                for k in ("label", "name", "value", "title", "text"):
-                    v = item.get(k)
-                    if isinstance(v, str) and v.strip():
+            if isinstance(item,(str,int,float)): parts.append(str(item))
+            elif isinstance(item,dict):
+                for k in ("label","name","value","title","text"):
+                    v=item.get(k)
+                    if isinstance(v,str) and v.strip():
                         parts.append(v); break
         return " ".join(parts)
     return str(val)
 
-
-# ---------- Label detection (fuzzy but safe) ----------
-# Accept exact labels or titles that START with the label (e.g., "RECORD DATE: ..."),
-# while rejecting range-like titles ("RANGE", "WINDOW", "TO", etc.).
+# ---------- Label detection ----------
 RANGE_BLOCK = re.compile(r"^(?:[:\-–—\s]*)(RANGE|WINDOW|THRU|THROUGH|TO|BETWEEN|FROM)\b", re.IGNORECASE)
-RECORD_START = re.compile(r"^\s*RECORD\s*DATE\b(.*)$", re.IGNORECASE)
-MEETING_START = re.compile(r"^\s*MEETING\s*DATE\b(.*)$", re.IGNORECASE)
-
-def _is_single_label_task(text: str, kind: str) -> bool:
-    if not text:
-        return False
-    t = (text or "").strip()
-    up = t.upper()
-
-    if kind == "record":
-        if up == "RECORD DATE":
-            return True
-        m = RECORD_START.match(t)
-    else:
-        if up == "MEETING DATE":
-            return True
-        m = MEETING_START.match(t)
-
-    if not m:
-        return False
-    tail = (m.group(1) or "").strip()
-    tail = re.sub(r"^[\s:–—-]+", "", tail)
-    return not RANGE_BLOCK.match(tail)
-
-# --- Exact label matchers ---
 EXACT_RECORD = re.compile(r"^\s*RECORD\s*DATE\s*$", re.IGNORECASE)
 EXACT_MEETING = re.compile(r"^\s*MEETING\s*DATE\s*$", re.IGNORECASE)
 
 def is_exact_label(title: str, kind: str) -> bool:
-    if not title:
-        return False
-    return bool((EXACT_RECORD if kind == "record" else EXACT_MEETING).match(title))
+    if not title: return False
+    return bool((EXACT_RECORD if kind=="record" else EXACT_MEETING).match(title))
 
-# --- Strict fuzzy matcher (keeps your existing logic & blockers) ---
-BLOCKERS_ANY = re.compile(r"\b(RANGE|WINDOW|THRU|THROUGH|TO|BETWEEN|FROM)\b", re.IGNORECASE)
-BAD_TAIL_WORDS = re.compile(
-    r"\b(FILE|FILES|DOCS?|PDF|UPLOAD|LINK|DRAFT|CHECKLIST|NOTE|NOTES|TEMPLATE|PACKAGE|PKG|MATERIALS?|SUBMISSION|REPORT|STATUS|EMAIL)\b",
-    re.IGNORECASE,
-)
-RECORD_ANY = re.compile(r"\bRECORD\s*DATE\b", re.IGNORECASE)
-MEETING_ANY = re.compile(r"\bMEETING\s*DATE\b", re.IGNORECASE)
-_SEP_STRIP = re.compile(r"^[\s:–—-]+")
-
-def is_label_task_strict(title: str, kind: str) -> bool:
-    """
-    Accept ONLY:
-      - exact 'RECORD DATE' / 'MEETING DATE', OR
-      - label anywhere, followed by separators and a date-ish or placeholder tail.
-    Reject range/window/admin-helper titles.
-    """
-    if not title or BLOCKERS_ANY.search(title):
-        return False
-    if is_exact_label(title, kind):
-        return True
-
-    pat = RECORD_ANY if kind == "record" else MEETING_ANY
-    m = pat.search(title)
-    if not m:
-        return False
-
-    tail = _SEP_STRIP.sub("", (title[m.end():] or "")).strip()
-    if tail == "":
-        return True  # effectively exact after trailing whitespace/separators
-
-    if BAD_TAIL_WORDS.search(tail):
-        return False
-
-    ts = pd.to_datetime(tail, errors="coerce")
-    if not pd.isna(ts):
-        return True
-
-    if re.fullmatch(r"(TBD|TBA|N/?A|ASAP)", tail, re.IGNORECASE):
-        return True
-
-    return False
-
-
-# --- Stricter label matcher to ignore helper/admin tasks like "Record Date Date File" ---
-
-# Words that mean this isn't a single-day date task
-BLOCKERS_ANY = re.compile(r"\b(RANGE|WINDOW|THRU|THROUGH|TO|BETWEEN|FROM)\b", re.IGNORECASE)
-
-# Tails that clearly indicate files/admin (not a date)
-BAD_TAIL_WORDS = re.compile(
-    r"\b(FILE|FILES|DOCS?|PDF|UPLOAD|LINK|DRAFT|CHECKLIST|NOTE|NOTES|TEMPLATE|PACKAGE|PKG|MATERIALS?|SUBMISSION|REPORT|STATUS|EMAIL)\b",
-    re.IGNORECASE,
-)
-
-RECORD_ANY = re.compile(r"\bRECORD\s*DATE\b", re.IGNORECASE)
-MEETING_ANY = re.compile(r"\bMEETING\s*DATE\b", re.IGNORECASE)
-
-# Strip leading separators right after the label (":", "-", "—", whitespace)
-_SEP_STRIP = re.compile(r"^[\s:–—-]+")
-
-def is_label_task_strict(title: str, kind: str) -> bool:
-    """
-    Accept ONLY:
-      - exact 'RECORD DATE' / 'MEETING DATE'
-      - OR label followed by separators and a date-ish tail
-    Reject if the title/tail looks like a range/window or a file/admin helper.
-    """
-    if not title:
-        return False
-
-    if BLOCKERS_ANY.search(title):
-        return False
-
-    pat = RECORD_ANY if kind == "record" else MEETING_ANY
-    m = pat.search(title)
-    if not m:
-        return False
-
-    tail = _SEP_STRIP.sub("", (title[m.end():] or "")).strip()
-
-    # Exact label (no tail) → OK
-    if tail == "":
-        return True
-
-    # Tails that look like artifacts/admin → reject
-    if BAD_TAIL_WORDS.search(tail):
-        return False
-
-    # If tail parses as a date, also OK (we still only use due_date — this just validates the label)
-    ts = pd.to_datetime(tail, errors="coerce")
-    if not pd.isna(ts):
-        return True
-
-    # Allow common placeholders
-    if re.fullmatch(r"(TBD|TBA|N/?A|ASAP)", tail, re.IGNORECASE):
-        return True
-
-    # Anything else (e.g., "Date File") → reject
-    return False
-
+# Adjournment detection
+ADJ_EXACT   = re.compile(r"^\s*ADJOURN(?:MENT)?\s*DATE\s*$", re.IGNORECASE)
+ADJ_WORD    = re.compile(r"\bADJOURN\w*\b", re.IGNORECASE)
+MEETING_WORD= re.compile(r"\bMEETING\w*\b", re.IGNORECASE)
+def is_adjourn_label(title: str) -> bool:
+    if not title: return False
+    if ADJ_EXACT.match(title): return True
+    return bool(ADJ_WORD.search(title) and MEETING_WORD.search(title))
 
 # ---------- Date helpers ----------
 def iso_from_ms(ms: Any) -> Optional[str]:
     try:
         return pd.to_datetime(int(ms), unit="ms", utc=True).tz_convert(USER_TZ).date().isoformat()
-    except Exception:
-        return None
+    except Exception: return None
 
 def pick_best_iso(candidates: List[Tuple[str, bool]]) -> str:
-    """
-    candidates: list of (iso_date_str, is_open_status).
-    Strategy:
-      1) Prefer open tasks; else all tasks.
-      2) Among chosen set: earliest date >= today; if none, latest date < today.
-    """
-    if not candidates:
-        return ""
-
+    if not candidates: return ""
     today = pd.Timestamp.now(tz=USER_TZ).date()
-
     def pick(pool: List[str]) -> str:
-        if not pool:
-            return ""
+        if not pool: return ""
         dti = pd.to_datetime(pool, errors="coerce")
-        # Convert each timestamp to a Python date; skip NaT
         dates = sorted([ts.date() for ts in dti if not pd.isna(ts)])
-        if not dates:
-            return ""
+        if not dates: return ""
         future = [d for d in dates if d >= today]
         chosen = min(future) if future else max(dates)
         return chosen.isoformat()
-
-    open_pool = [iso for iso, is_open in candidates if is_open]
+    open_pool = [iso for iso,is_open in candidates if is_open]
     chosen = pick(open_pool)
-    if chosen:
-        return chosen
-
-    return pick([iso for iso, _ in candidates])
+    if chosen: return chosen
+    return pick([iso for iso,_ in candidates])
 
 def status_is_open(t: Dict[str, Any]) -> bool:
     stobj = t.get("status") or {}
-    # ClickUp uses status.type in {"open","closed"}; default to True if missing
     return (stobj.get("type") or "open").lower() != "closed"
 
-def cf_value_to_text(val: Any) -> str:
-    """Best-effort stringify for ClickUp CF values (text, dropdown objects, lists, etc.)."""
-    if val is None:
-        return ""
-    if isinstance(val, str):
-        return val
-    if isinstance(val, (int, float)):
-        return str(val)
-
-    if isinstance(val, dict):
-        # Try common label/name keys first
-        for k in ("label", "name", "value", "title", "text"):
-            v = val.get(k)
-            if isinstance(v, str) and v.strip():
-                return v
-        # Fallback: join simple values
-        parts = []
-        for v in val.values():
-            if isinstance(v, (str, int, float)) and str(v).strip():
-                parts.append(str(v))
-        return " ".join(parts)
-
-    if isinstance(val, list):
-        parts = []
-        for item in val:
-            if isinstance(item, (str, int, float)):
-                parts.append(str(item))
-            elif isinstance(item, dict):
-                for k in ("label", "name", "value", "title", "text"):
-                    v = item.get(k)
-                    if isinstance(v, str) and v.strip():
-                        parts.append(v)
-                        break
-        return " ".join(parts)
-
-    # Last resort
-    return str(val)
-
-
-# ---------- Scan a folder for codes & dates ----------
+# ---------- Scan a folder ----------
 def scan_folder_metadata(folder_id: str, token: str) -> dict:
-    """
-    Single-pass scan of a folder to gather:
-      - mc_code: first MC####/MCA### found (lists -> tasks -> CF strings)
-      - brd_code: ALL S/P/Z + 5 digits found (lists -> tasks -> CF strings), joined by ", "
-      - record_date / meeting_date: chosen from due_date of label tasks
-        * PRIORITY: exact 'RECORD DATE'/'MEETING DATE' tasks first; if none, use strict fuzzy
-      We only use due_date; no title/CF date parsing.
-    """
-    meta = {"mc_code": "", "brd_code": "", "record_date": "", "meeting_date": ""}
-
+    meta = {"mc_code": "", "brd_code": "", "record_date": "", "meeting_date": "", "adjournment_date": ""}
     lists = get_lists_in_folder(folder_id, token)
 
-    # Helper: append codes preserving first-seen order (no duplicates)
-    brd_accum: List[str] = []
-    seen_codes = set()
-
+    # accumulate BRD
+    brd_accum, seen_codes = [], set()
     def add_brd_codes(codes: List[str]):
-        nonlocal brd_accum, seen_codes
         for c in codes:
             if c not in seen_codes:
-                seen_codes.add(c)
-                brd_accum.append(c)
+                seen_codes.add(c); brd_accum.append(c)
 
-    # Quick pass on list names (codes only)
+    rec_exact, rec_fuzzy, mtg_exact, mtg_fuzzy, adj_cands = [], [], [], [], []
+
     for l in lists:
         lname = l.get("name") or ""
         if not meta["mc_code"]:
             mc = extract_mc_from_text(lname)
-            if mc:
-                meta["mc_code"] = mc
+            if mc: meta["mc_code"] = mc
         add_brd_codes(find_all_brd(lname))
 
-    # Collect candidates (split into EXACT vs FUZZY buckets)
-    rec_exact:   List[Tuple[str, bool]] = []
-    rec_fuzzy:   List[Tuple[str, bool]] = []
-    mtg_exact:   List[Tuple[str, bool]] = []
-    mtg_fuzzy:   List[Tuple[str, bool]] = []
-
     for l in lists:
-        for t in fetch_list_tasks(token, str(l["id"]), include_closed=True, include_subtasks=True, limit=100):
+        for t in fetch_list_tasks(token,str(l["id"]),include_closed=True,include_subtasks=True,limit=100):
             tname = t.get("name") or ""
             due_ms = t.get("due_date")
 
-            # Codes
-            # ----- CODES from task TITLE -----
-            # MC: first-hit only from the task name
             if not meta["mc_code"]:
                 mc = extract_mc_from_text(tname)
-                if mc:
-                    meta["mc_code"] = mc
-            
-            # BRD: collect all occurrences from the task name
+                if mc: meta["mc_code"] = mc
             add_brd_codes(find_all_brd(tname))
-            
-            # ----- CODES from custom fields (handle text, dropdowns, lists, etc.) -----
+
             for cf in (t.get("custom_fields") or []):
                 text = cf_value_to_text(cf.get("value"))
-                if not text:
-                    continue
-                if not meta["mc_code"]:
-                    mc = extract_mc_from_text(text)
-                    if mc:
-                        meta["mc_code"] = mc
-                add_brd_codes(find_all_brd(text))
+                if text:
+                    if not meta["mc_code"]:
+                        mc = extract_mc_from_text(text)
+                        if mc: meta["mc_code"] = mc
+                    add_brd_codes(find_all_brd(text))
 
-
-            # Dates (ONLY due_date)
-            if not due_ms:
-                continue
+            if not due_ms: continue
             iso = iso_from_ms(due_ms)
-            if not iso:
-                continue
+            if not iso: continue
             is_open = status_is_open(t)
 
-            # RECORD
-            if is_exact_label(tname, "record"):
-                rec_exact.append((iso, is_open))
-            elif is_label_task_strict(tname, "record"):
-                rec_fuzzy.append((iso, is_open))
+            if is_exact_label(tname,"record"): rec_exact.append((iso,is_open))
+            if is_exact_label(tname,"meeting"): mtg_exact.append((iso,is_open))
+            if is_adjourn_label(tname): adj_cands.append((iso,is_open))
 
-            # MEETING
-            if is_exact_label(tname, "meeting"):
-                mtg_exact.append((iso, is_open))
-            elif is_label_task_strict(tname, "meeting"):
-                mtg_fuzzy.append((iso, is_open))
-
-    # Pick exact first; only if none exist do we use fuzzy
-    meta["record_date"]  = pick_best_iso(rec_exact) or pick_best_iso(rec_fuzzy)
-    meta["meeting_date"] = pick_best_iso(mtg_exact) or pick_best_iso(mtg_fuzzy)
-
-    # Join all BRD codes into a single cell
+    meta["record_date"]      = pick_best_iso(rec_exact) or pick_best_iso(rec_fuzzy)
+    meta["meeting_date"]     = pick_best_iso(mtg_exact) or pick_best_iso(mtg_fuzzy)
+    meta["adjournment_date"] = pick_best_iso(adj_cands)
     meta["brd_code"] = ", ".join(brd_accum)
     return meta
 
-
-# ---------- Fixed-run button ----------
-if not token:
-    st.warning("Add your ClickUp token to proceed (paste above or set in Streamlit Secrets).")
-    st.stop()
-
+# ---------- Run ----------
 run = st.button("Build & Export", type="primary", use_container_width=True)
 
 try:
     if run:
         with st.spinner("Resolving Workspace and Space…"):
             teams = get_workspaces(token)
-            ws = next(
-                (t for t in teams if (t.get("name") or "").strip().lower() == WORKSPACE_NAME.lower()),
-                None,
-            )
+            ws = next((t for t in teams if (t.get("name") or "").strip().lower() == WORKSPACE_NAME.lower()),None)
             if not ws:
-                st.error(f'Workspace "{WORKSPACE_NAME}" not found for this token.')
+                st.error(f'Workspace "{WORKSPACE_NAME}" not found.')
                 st.stop()
             team_id = str(ws["id"])
-
             spaces = get_spaces(team_id, token)
-            space = next(
-                (s for s in spaces if (s.get("name") or "").strip().lower() == SPACE_NAME.lower()),
-                None,
-            )
+            space = next((s for s in spaces if (s.get("name") or "").strip().lower() == SPACE_NAME.lower()),None)
             if not space:
-                st.error(f'Space "{SPACE_NAME}" not found in workspace "{WORKSPACE_NAME}".')
+                st.error(f'Space "{SPACE_NAME}" not found.')
                 st.stop()
             space_id = str(space["id"])
 
         with st.spinner("Scanning folders and building dataset…"):
             folders = get_space_folders(space_id, token)
-
-            rows: List[Dict[str, Any]] = []
+            rows=[]
             for f in folders:
-                folder_id = str(f.get("id"))
-                title = f.get("name") or ""
+                folder_id = str(f.get("id")); title=f.get("name") or ""
+                jobs=parse_folder_multi(title)
+                meta=scan_folder_metadata(folder_id,token)
+                for job_num,job_name in jobs:
+                    rows.append({
+                        "Job Number": job_num,
+                        "Job Name": job_name,
+                        "Broadridge MC": meta["mc_code"],
+                        "BRD S or P Job Number": meta["brd_code"],
+                        "Record Date": meta["record_date"],
+                        "Meeting Date": meta["meeting_date"],
+                        "Adjournment Date": meta["adjournment_date"],
+                        "Folder ID": folder_id,
+                        "Folder Title": title,
+                    })
+            df=pd.DataFrame(rows)
+            df=df[df["Job Name"].str.upper()!="PROJECT LIST TEMPLATE"]
+            df=df.sort_values(["Job Number","Job Name"],na_position="last").reset_index(drop=True)
 
-                jobs = parse_folder_multi(title)
-                meta = scan_folder_metadata(folder_id, token)
+            final_cols=["Job Number","Job Name","Broadridge MC","BRD S or P Job Number","Record Date","Meeting Date","Adjournment Date"]
+            out_df=df.reindex(columns=final_cols).copy()
+            for col in ["Record Date","Meeting Date","Adjournment Date"]:
+                out_df[col]=pd.to_datetime(out_df[col],errors="coerce").dt.date
+            out_df=out_df.where(pd.notnull(out_df),"")
 
-                for job_num, job_name in jobs:
-                    rows.append(
-                        {
-                            "Job Number": job_num,
-                            "Job Name": job_name,
-                            "Broadridge MC": meta["mc_code"],
-                            "BRD S or P Job Number": meta["brd_code"],
-                            "Record Date": meta["record_date"],
-                            "Meeting Date": meta["meeting_date"],
-                            "Folder ID": folder_id,
-                            "Folder Title": title,
-                        }
-                    )
-
-            df = pd.DataFrame(rows)
-
-            # Remove placeholder rows (e.g. PROJECT LIST TEMPLATE)
-            df = df[df["Job Name"].str.upper() != "PROJECT LIST TEMPLATE"]
-
-            df = df.sort_values(["Job Number", "Job Name"], na_position="last").reset_index(drop=True)
-
-            # Shape final columns and convert dates to true date objects
-            final_cols = [
-                "Job Number",
-                "Job Name",
-                "Broadridge MC",
-                "BRD S or P Job Number",
-                "Record Date",
-                "Meeting Date",
-            ]
-            out_df = df.reindex(columns=final_cols).copy()
-            for col in ["Record Date", "Meeting Date"]:
-                out_df[col] = pd.to_datetime(out_df[col], errors="coerce").dt.date
-            out_df = out_df.where(pd.notnull(out_df), "")
-            # Cast Job Number to numeric (drop non-numeric safely)
-            out_df["Job Number"] = pd.to_numeric(out_df["Job Number"], errors="coerce").astype("Int64")
-
-            # Build sorted views
-            by_client = out_df.sort_values(["Job Name", "Job Number"], na_position="last")
-            
-            # Robust future-first ordering for Meeting Date (future → past → blanks)
-            mdt = pd.to_datetime(out_df["Meeting Date"], errors="coerce")
-            
-            # Make 'today' tz-naive (matches mdt which is tz-naive)
-            today = pd.Timestamp(pd.Timestamp.now(tz=USER_TZ).date())
-            
-            fut_mask   = mdt.notna() & (mdt >= today)
-            past_mask  = mdt.notna() & (mdt <  today)
-            blank_mask = mdt.isna()
-            
-            # Sort each group independently, then stack
-            fut   = out_df.loc[fut_mask].sort_values(
-                "Meeting Date", key=lambda s: pd.to_datetime(s, errors="coerce"), ascending=True
-            )
-            past  = out_df.loc[past_mask].sort_values(
-                "Meeting Date", key=lambda s: pd.to_datetime(s, errors="coerce"), ascending=False
-            )
-            blank = out_df.loc[blank_mask]
-            
-            by_mtg = pd.concat([fut, past, blank], ignore_index=True)
-
-            
-            # Helper to format a sheet (freeze header, filters, widths, number formats)
-            def _format_sheet(ws):
-                from openpyxl.utils import get_column_letter
-            
-                # Freeze header row
-                ws.freeze_panes = "A2"
-            
-                # AutoFilter full used range
-                max_col, max_row = ws.max_column, ws.max_row
-                ws.auto_filter.ref = f"A1:{ws.cell(row=1, column=max_col).column_letter}{max_row}"
-            
-                # Header index
-                header_idx = {cell.value: cell.column for cell in ws[1] if cell.value}
-            
-                # Number formats
-                if "Job Number" in header_idx:
-                    col_letter = ws.cell(row=1, column=header_idx["Job Number"]).column_letter
-                    for r in range(2, max_row + 1):
-                        ws[f"{col_letter}{r}"].number_format = "0"
-                for col_name in ["Record Date", "Meeting Date"]:
-                    if col_name in header_idx:
-                        col_letter = ws.cell(row=1, column=header_idx[col_name]).column_letter
-                        for r in range(2, max_row + 1):
-                            ws[f"{col_letter}{r}"].number_format = "yyyy-mm-dd"
-            
-                # Auto-size columns
-                for c in range(1, max_col + 1):
-                    letter = get_column_letter(c)
-                    max_len = 0
-                    for r in range(1, max_row + 1):
-                        v = ws[f"{letter}{r}"].value
-                        v = "" if v is None else str(v)
-                        if len(v) > max_len:
-                            max_len = len(v)
-                    ws.column_dimensions[letter].width = min(max(10, max_len + 2), 60)
-            
-            # Write Excel with two tabs
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl", date_format="YYYY-MM-DD") as xw:
-                by_client.to_excel(xw, index=False, sheet_name="By Client Name")
-                by_mtg.to_excel(xw, index=False, sheet_name="By Meeting Date")
-            
-                # Format both sheets
-                _format_sheet(xw.book["By Client Name"])
-                _format_sheet(xw.book["By Meeting Date"])
-
-            def _fit_text(pdf: "FPDF", text: str, cell_w_mm: float) -> str:
-                """Truncate text with … to fit into a cell width."""
-                text = "" if text is None else str(text)
-                ell = "…"
-                # Leave a tiny padding so borders look clean
-                max_w = max(0, cell_w_mm - 1.5)
-                if pdf.get_string_width(text) <= max_w:
-                    return text
-                while text and pdf.get_string_width(text + ell) > max_w:
-                    text = text[:-1]
-                return (text + ell) if text else ""
-            
-            def _add_df_sheet_to_pdf(pdf: "FPDF", df: pd.DataFrame, title: str) -> None:
-                """Add one sheet to the PDF, starting on a new page, with an auto-sized table."""
-                # Start page + title
-                pdf.add_page(orientation="L")  # Landscape for wider tables
-                pdf.set_font("Helvetica", "B", 14)
-                pdf.cell(0, 9, title, ln=1)
-                pdf.ln(1)
-            
-                # Copy and format dates as strings for stable rendering
-                df = df.copy()
-                for col in ["Record Date", "Meeting Date"]:
-                    if col in df.columns:
-                        df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%Y-%m-%d")
-                df = df.fillna("")
-            
-                # Compute column widths (based on 90th percentile text length, clamped)
-                pdf.set_font("Helvetica", "", 8)
-                page_w = pdf.w - 2 * pdf.l_margin
-                cols = list(df.columns)
-            
-                # Sample up to 200 rows to estimate widths
-                sample = df.head(200).astype(str)
-                char_scores = []
-                for c in cols:
-                    lengths = sample[c].str.len()
-                    score = max(len(str(c)), int(lengths.quantile(0.90)))  # header vs 90th pct
-                    score = max(6, min(score, 30))  # clamp per-column weight
-                    char_scores.append(score)
-            
-                total = sum(char_scores) or 1
-                widths = [page_w * (s / total) for s in char_scores]
-                row_h = 6
-            
-                # Header
-                pdf.set_font("Helvetica", "B", 9)
-                for w, col in zip(widths, cols):
-                    pdf.cell(w, row_h, _fit_text(pdf, str(col), w), border=1)
-                pdf.ln(row_h)
-            
-                # Body
-                pdf.set_font("Helvetica", "", 8)
-                for _, r in df.iterrows():
-                    # Auto page-break handled by FPDF; just keep writing rows
-                    for w, col in zip(widths, cols):
-                        val = r[col]
-                        pdf.cell(w, row_h, _fit_text(pdf, "" if pd.isna(val) else str(val), w), border=1)
-                    pdf.ln(row_h)
-
-            
-            # After writing both sheets and formatting:
+            buf=io.BytesIO()
+            with pd.ExcelWriter(buf,engine="openpyxl",date_format="YYYY-MM-DD") as xw:
+                out_df.to_excel(xw,index=False,sheet_name="Jobs")
             buf.seek(0)
-            
-            # ✅ Restore success message + download button
+
             st.success(f"Built {len(out_df)} rows from '{WORKSPACE_NAME}' → '{SPACE_NAME}'.")
-            st.download_button(
-                "Download ACTIVE_Proxy_Jobs.xlsx",
-                data=buf.getvalue(),
+            st.download_button("Download ACTIVE_Proxy_Jobs.xlsx",data=buf.getvalue(),
                 file_name="ACTIVE_Proxy_Jobs.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+                use_container_width=True)
+            st.dataframe(out_df.head(50),use_container_width=True)
 
-            # --- PDF download (2 pages: By Client Name, By Meeting Date) ---
-            if HAS_FPDF:
-                pdf = FPDF(unit="mm", format="A4")
-                pdf.set_auto_page_break(auto=True, margin=10)
-            
-                pdf_cols = ["Job Number", "Job Name", "Broadridge MC", "BRD S or P Job Number", "Record Date", "Meeting Date"]
-                by_client_pdf = by_client.reindex(columns=pdf_cols)
-                by_mtg_pdf    = by_mtg.reindex(columns=pdf_cols)
-            
-                _add_df_sheet_to_pdf(pdf, by_client_pdf, "By Client Name")
-                _add_df_sheet_to_pdf(pdf, by_mtg_pdf, "By Meeting Date")
-            
-                # ✅ Robust bytes handling across fpdf versions
-                pdf_buf = pdf.output(dest="S")  # bytes/bytearray/str depending on lib
-                if isinstance(pdf_buf, str):
-                    pdf_bytes = pdf_buf.encode("latin-1")
-                else:
-                    pdf_bytes = bytes(pdf_buf)
-            
-                st.download_button(
-                    "Download ACTIVE_Proxy_Jobs.pdf",
-                    data=pdf_bytes,
-                    file_name="ACTIVE_Proxy_Jobs.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-            else:
-                st.info("To enable PDF download, add **fpdf2** to your environment (e.g., requirements.txt: `fpdf2`).")
-
-
-            st.divider()
-            st.subheader("Preview")
-            st.dataframe(out_df.head(50), use_container_width=True)
-
-except requests.HTTPError as e:
-    st.error(f"HTTP error: {e.response.status_code} {e.response.text[:300]}")
 except Exception as e:
     st.error(f"Unexpected error: {e}")
