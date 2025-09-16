@@ -340,23 +340,28 @@ try:
             
                 pdf = FPDF(orientation="L", unit="mm", format="A4")
                 pdf.add_page()
-                pdf.set_font("Arial", "B", 10)
             
-                col_widths = [30, 60, 30, 40, 30, 30, 40]
+                # Scale column widths to fit the full page width
+                page_width = pdf.w - 2 * pdf.l_margin
+                base_widths = [30, 60, 30, 40, 30, 30, 40]  # your original proportions
+                scale = page_width / sum(base_widths)
+                col_widths = [w * scale for w in base_widths]
+            
+                # Header
+                pdf.set_font("Arial", "B", 9)
                 for i, col in enumerate(pdf_cols):
                     pdf.cell(col_widths[i], 8, col, 1, 0, "C")
                 pdf.ln()
             
-                pdf.set_font("Arial", "", 9)
+                # Rows
+                pdf.set_font("Arial", "", 8)
                 for _, row in out_df.fillna("").iterrows():
                     for i, col in enumerate(pdf_cols):
                         val = str(row[col]) if row[col] else ""
-                        pdf.cell(col_widths[i], 8, val, 1, 0, "C")
+                        pdf.cell(col_widths[i], 6, val, 1, 0, "C")
                     pdf.ln()
             
-                # FIX: output() already returns a bytearray
                 pdf_buf = io.BytesIO(pdf.output(dest="S"))
-            
                 st.download_button(
                     "Download ACTIVE_Proxy_Jobs.pdf",
                     data=pdf_buf.getvalue(),
@@ -364,7 +369,6 @@ try:
                     mime="application/pdf",
                     use_container_width=True,
                 )
-
 
             st.dataframe(out_df.head(50),use_container_width=True)
 
