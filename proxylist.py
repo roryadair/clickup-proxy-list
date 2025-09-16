@@ -311,12 +311,17 @@ try:
             future = df_meeting[df_meeting["is_future"]].sort_values("MeetingDate_tmp", ascending=True)
             past   = df_meeting[~df_meeting["is_future"] & df_meeting["MeetingDate_tmp"].notna()].sort_values("MeetingDate_tmp", ascending=False)
             blanks = df_meeting[df_meeting["MeetingDate_tmp"].isna()]
-            
+
+            by_meeting = out_df.sort_values(
+                ["Meeting Date"], ascending=False, na_position="last"
+            )
+
+"""          
             by_meeting = pd.concat([future, past, blanks], ignore_index=True)
             
             # Drop helper cols for export
             by_meeting = by_meeting.drop(columns=["MeetingDate_tmp","is_future"])
-
+"""
             # Replace NaT with blanks for export
             excel_df_name = by_name.fillna("")
             excel_df_meeting = by_meeting.fillna("")
