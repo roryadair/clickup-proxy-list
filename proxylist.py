@@ -295,17 +295,30 @@ try:
                 out_df[col]=pd.to_datetime(out_df[col],errors="coerce").dt.date
             out_df=out_df.where(pd.notnull(out_df),"")
 
-            buf=io.BytesIO()
-            with pd.ExcelWriter(buf,engine="openpyxl",date_format="YYYY-MM-DD") as xw:
-                out_df.to_excel(xw,index=False,sheet_name="Jobs")
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl", date_format="YYYY-MM-DD") as xw:
+                # 1. By Job Name
+                out_df.sort_values(["Job Name"], na_position="last").to_excel(
+                    xw, index=False, sheet_name="Jobs_by_Name"
+                )
+            
+                # 2. By Meeting Date
+                out_df.sort_values(["Meeting Date"], na_position="last").to_excel(
+                    xw, index=False, sheet_name="Jobs_by_MeetingDate"
+                )
+            
             buf.seek(0)
-
+            
             st.success(f"Built {len(out_df)} rows from '{WORKSPACE_NAME}' → '{SPACE_NAME}'.")
-            st.download_button("Download ACTIVE_Proxy_Jobs.xlsx",data=buf.getvalue(),
+            st.download_button(
+                "Download ACTIVE_Proxy_Jobs.xlsx",
+                data=buf.getvalue(),
                 file_name="ACTIVE_Proxy_Jobs.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True)
-            st.dataframe(out_df.head(50),use_container_width=True)
+                use_container_width=True,
+            )
+            
+            st.dataframe(out_df.head(50), use_container_width=True)
 
 except Exception as e:
     st.error(f"Unexpected error: {e}")
