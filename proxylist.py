@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# PDF export (install: pip install fpdf2)
+# PDF export
 try:
     from fpdf import FPDF
     HAS_FPDF = True
@@ -25,7 +25,7 @@ SPACE_NAME = "ACTIVE Proxy Efforts"
 st.set_page_config(page_title="ACTIVE Proxy Jobs Export", page_icon="📊")
 st.title("ACTIVE Proxy Jobs Export")
 st.caption(
-    "Exports a 7-column Excel from ClickUp → Job Number, Job Name, Broadridge MC, "
+    "Exports Excel/PDF from ClickUp → Job Number, Job Name, Broadridge MC, "
     "BRD S/P/Z Job Number, Record Date, Meeting Date, Adjournment Date."
 )
 
@@ -150,18 +150,16 @@ def cf_value_to_text(val: Any) -> str:
     return str(val)
 
 # ---------- Label detection ----------
-RANGE_BLOCK = re.compile(r"^(?:[:\-–—\s]*)(RANGE|WINDOW|THRU|THROUGH|TO|BETWEEN|FROM)\b", re.IGNORECASE)
 EXACT_RECORD = re.compile(r"^\s*RECORD\s*DATE\s*$", re.IGNORECASE)
 EXACT_MEETING = re.compile(r"^\s*MEETING\s*DATE\s*$", re.IGNORECASE)
+ADJ_EXACT   = re.compile(r"^\s*ADJOURN(?:MENT)?\s*DATE\s*$", re.IGNORECASE)
+ADJ_WORD    = re.compile(r"\bADJOURN\w*\b", re.IGNORECASE)
+MEETING_WORD= re.compile(r"\bMEETING\w*\b", re.IGNORECASE)
 
 def is_exact_label(title: str, kind: str) -> bool:
     if not title: return False
     return bool((EXACT_RECORD if kind=="record" else EXACT_MEETING).match(title))
 
-# Adjournment detection
-ADJ_EXACT   = re.compile(r"^\s*ADJOURN(?:MENT)?\s*DATE\s*$", re.IGNORECASE)
-ADJ_WORD    = re.compile(r"\bADJOURN\w*\b", re.IGNORECASE)
-MEETING_WORD= re.compile(r"\bMEETING\w*\b", re.IGNORECASE)
 def is_adjourn_label(title: str) -> bool:
     if not title: return False
     if ADJ_EXACT.match(title): return True
@@ -205,7 +203,7 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
             if c not in seen_codes:
                 seen_codes.add(c); brd_accum.append(c)
 
-    rec_exact, rec_fuzzy, mtg_exact, mtg_fuzzy, adj_cands = [], [], [], [], []
+    rec_exact, mtg_exact, adj_cands = [], [], []
 
     for l in lists:
         lname = l.get("name") or ""
@@ -241,8 +239,8 @@ def scan_folder_metadata(folder_id: str, token: str) -> dict:
             if is_exact_label(tname,"meeting"): mtg_exact.append((iso,is_open))
             if is_adjourn_label(tname): adj_cands.append((iso,is_open))
 
-    meta["record_date"]      = pick_best_iso(rec_exact) or pick_best_iso(rec_fuzzy)
-    meta["meeting_date"]     = pick_best_iso(mtg_exact) or pick_best_iso(mtg_fuzzy)
+    meta["record_date"]      = pick_best_iso(rec_exact)
+    meta["meeting_date"]     = pick_best_iso(mtg_exact)
     meta["adjournment_date"] = pick_best_iso(adj_cands)
     meta["brd_code"] = ", ".join(brd_accum)
     return meta
@@ -291,34 +289,55 @@ try:
 
             final_cols=["Job Number","Job Name","Broadridge MC","BRD S or P Job Number","Record Date","Meeting Date","Adjournment Date"]
             out_df=df.reindex(columns=final_cols).copy()
+
+            # Convert to datetime.date (NaT if blank)
             for col in ["Record Date","Meeting Date","Adjournment Date"]:
                 out_df[col]=pd.to_datetime(out_df[col],errors="coerce").dt.date
-            out_df=out_df.where(pd.notnull(out_df),"")
 
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl", date_format="YYYY-MM-DD") as xw:
-                # 1. By Job Name
-                out_df.sort_values(["Job Name"], na_position="last").to_excel(
-                    xw, index=False, sheet_name="Jobs_by_Name"
-                )
-            
-                # 2. By Meeting Date
-                out_df.sort_values(["Meeting Date"], na_position="last").to_excel(
-                    xw, index=False, sheet_name="Jobs_by_MeetingDate"
-                )
-            
+            # Build sorted views
+            by_name = out_df.sort_values(["Job Name"], na_position="last")
+            by_meeting = out_df.sort_values(["Meeting Date"], na_position="last")
+
+            # Replace NaT with blanks for export
+            excel_df_name = by_name.fillna("")
+            excel_df_meeting = by_meeting.fillna("")
+
+            buf=io.BytesIO()
+            with pd.ExcelWriter(buf,engine="openpyxl",date_format="YYYY-MM-DD") as xw:
+                excel_df_name.to_excel(xw,index=False,sheet_name="Jobs_by_Name")
+                excel_df_meeting.to_excel(xw,index=False,sheet_name="Jobs_by_MeetingDate")
             buf.seek(0)
-            
+
             st.success(f"Built {len(out_df)} rows from '{WORKSPACE_NAME}' → '{SPACE_NAME}'.")
-            st.download_button(
-                "Download ACTIVE_Proxy_Jobs.xlsx",
+            st.download_button("Download ACTIVE_Proxy_Jobs.xlsx",
                 data=buf.getvalue(),
                 file_name="ACTIVE_Proxy_Jobs.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-            
-            st.dataframe(out_df.head(50), use_container_width=True)
+                use_container_width=True)
+
+            if HAS_FPDF:
+                pdf_cols = ["Job Number","Job Name","Broadridge MC","BRD S or P Job Number","Record Date","Meeting Date","Adjournment Date"]
+                pdf = FPDF(orientation="L", unit="mm", format="A4")
+                pdf.add_page()
+                pdf.set_font("Arial", "B", 10)
+                col_widths = [30, 60, 30, 40, 30, 30, 40]
+                for i,col in enumerate(pdf_cols):
+                    pdf.cell(col_widths[i],8,col,1,0,"C")
+                pdf.ln()
+                pdf.set_font("Arial","",9)
+                for _,row in out_df.fillna("").iterrows():
+                    for i,col in enumerate(pdf_cols):
+                        val=str(row[col]) if row[col] else ""
+                        pdf.cell(col_widths[i],8,val,1,0,"C")
+                    pdf.ln()
+                pdf_buf=io.BytesIO(pdf.output(dest="S").encode("latin1"))
+                st.download_button("Download ACTIVE_Proxy_Jobs.pdf",
+                    data=pdf_buf.getvalue(),
+                    file_name="ACTIVE_Proxy_Jobs.pdf",
+                    mime="application/pdf",
+                    use_container_width=True)
+
+            st.dataframe(out_df.head(50),use_container_width=True)
 
 except Exception as e:
     st.error(f"Unexpected error: {e}")
