@@ -316,26 +316,36 @@ try:
                 use_container_width=True)
 
             if HAS_FPDF:
-                pdf_cols = ["Job Number","Job Name","Broadridge MC","BRD S or P Job Number","Record Date","Meeting Date","Adjournment Date"]
+                pdf_cols = ["Job Number","Job Name","Broadridge MC","BRD S or P Job Number",
+                            "Record Date","Meeting Date","Adjournment Date"]
+            
                 pdf = FPDF(orientation="L", unit="mm", format="A4")
                 pdf.add_page()
                 pdf.set_font("Arial", "B", 10)
+            
                 col_widths = [30, 60, 30, 40, 30, 30, 40]
-                for i,col in enumerate(pdf_cols):
-                    pdf.cell(col_widths[i],8,col,1,0,"C")
+                for i, col in enumerate(pdf_cols):
+                    pdf.cell(col_widths[i], 8, col, 1, 0, "C")
                 pdf.ln()
-                pdf.set_font("Arial","",9)
-                for _,row in out_df.fillna("").iterrows():
-                    for i,col in enumerate(pdf_cols):
-                        val=str(row[col]) if row[col] else ""
-                        pdf.cell(col_widths[i],8,val,1,0,"C")
+            
+                pdf.set_font("Arial", "", 9)
+                for _, row in out_df.fillna("").iterrows():
+                    for i, col in enumerate(pdf_cols):
+                        val = str(row[col]) if row[col] else ""
+                        pdf.cell(col_widths[i], 8, val, 1, 0, "C")
                     pdf.ln()
-                pdf_buf=io.BytesIO(pdf.output(dest="S").encode("latin1"))
-                st.download_button("Download ACTIVE_Proxy_Jobs.pdf",
+            
+                # FIX: output() already returns a bytearray
+                pdf_buf = io.BytesIO(pdf.output(dest="S"))
+            
+                st.download_button(
+                    "Download ACTIVE_Proxy_Jobs.pdf",
                     data=pdf_buf.getvalue(),
                     file_name="ACTIVE_Proxy_Jobs.pdf",
                     mime="application/pdf",
-                    use_container_width=True)
+                    use_container_width=True,
+                )
+
 
             st.dataframe(out_df.head(50),use_container_width=True)
 
