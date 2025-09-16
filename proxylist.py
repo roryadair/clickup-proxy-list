@@ -296,7 +296,26 @@ try:
 
             # Build sorted views
             by_name = out_df.sort_values(["Job Name"], na_position="last")
-            by_meeting = out_df.sort_values(["Meeting Date"], na_position="last")
+            today = pd.Timestamp.now(tz=USER_TZ).date()
+
+            # Add helper columns
+            df_meeting = out_df.copy()
+            df_meeting["MeetingDate_tmp"] = pd.to_datetime(df_meeting["Meeting Date"], errors="coerce")
+            df_meeting["is_future"] = df_meeting["MeetingDate_tmp"].dt.date >= today
+            
+            # Custom sort:
+            #   1. Future dates first (True=1, False=0, so we invert with ascending=False)
+            #   2. Within future → ascending by date
+            #   3. Within past → descending by date (nearest past first)
+            #   4. NaT at bottom
+            future = df_meeting[df_meeting["is_future"]].sort_values("MeetingDate_tmp", ascending=True)
+            past   = df_meeting[~df_meeting["is_future"] & df_meeting["MeetingDate_tmp"].notna()].sort_values("MeetingDate_tmp", ascending=False)
+            blanks = df_meeting[df_meeting["MeetingDate_tmp"].isna()]
+            
+            by_meeting = pd.concat([future, past, blanks], ignore_index=True)
+            
+            # Drop helper cols for export
+            by_meeting = by_meeting.drop(columns=["MeetingDate_tmp","is_future"])
 
             # Replace NaT with blanks for export
             excel_df_name = by_name.fillna("")
