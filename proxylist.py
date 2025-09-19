@@ -316,12 +316,6 @@ try:
                 ["Meeting Date"], ascending=False, na_position="last"
             )
 
-"""          
-            by_meeting = pd.concat([future, past, blanks], ignore_index=True)
-            
-            # Drop helper cols for export
-            by_meeting = by_meeting.drop(columns=["MeetingDate_tmp","is_future"])
-"""
             # Replace NaT with blanks for export
             excel_df_name = by_name.fillna("")
             excel_df_meeting = by_meeting.fillna("")
