@@ -353,13 +353,14 @@ try:
                 pdf.ln()
             
                 # Rows
+                # Rows (sorted by Meeting Date newest → oldest)
                 pdf.set_font("Arial", "", 8)
-                for _, row in out_df.fillna("").iterrows():
+                for _, row in by_meeting.fillna("").iterrows():
                     for i, col in enumerate(pdf_cols):
                         val = str(row[col]) if row[col] else ""
                         pdf.cell(col_widths[i], 6, val, 1, 0, "C")
                     pdf.ln()
-            
+
                 pdf_buf = io.BytesIO(pdf.output(dest="S"))
                 st.download_button(
                     "Download ACTIVE_Proxy_Jobs.pdf",
