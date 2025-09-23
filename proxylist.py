@@ -296,81 +296,72 @@ try:
 
             # Build sorted views
             by_name = out_df.sort_values(["Job Name"], na_position="last")
-            today = pd.Timestamp.now(tz=USER_TZ).date()
+            by_meeting = out_df.sort_values(["Meeting Date"], ascending=False, na_position="last")
 
-            # Add helper columns
-            df_meeting = out_df.copy()
-            df_meeting["MeetingDate_tmp"] = pd.to_datetime(df_meeting["Meeting Date"], errors="coerce")
-            df_meeting["is_future"] = df_meeting["MeetingDate_tmp"].dt.date >= today
-            
-            # Custom sort:
-            #   1. Future dates first (True=1, False=0, so we invert with ascending=False)
-            #   2. Within future → ascending by date
-            #   3. Within past → descending by date (nearest past first)
-            #   4. NaT at bottom
-            future = df_meeting[df_meeting["is_future"]].sort_values("MeetingDate_tmp", ascending=True)
-            past   = df_meeting[~df_meeting["is_future"] & df_meeting["MeetingDate_tmp"].notna()].sort_values("MeetingDate_tmp", ascending=False)
-            blanks = df_meeting[df_meeting["MeetingDate_tmp"].isna()]
+            # Save in session state for later downloads
+            st.session_state["out_df"] = out_df
+            st.session_state["by_name"] = by_name
+            st.session_state["by_meeting"] = by_meeting
 
-            by_meeting = out_df.sort_values(
-                ["Meeting Date"], ascending=False, na_position="last"
+    # --- Download/export section (always available if data exists) ---
+    if "out_df" in st.session_state:
+        out_df = st.session_state["out_df"]
+        by_name = st.session_state["by_name"]
+        by_meeting = st.session_state["by_meeting"]
+
+        # Replace NaT with blanks for export
+        excel_df_name = by_name.fillna("")
+        excel_df_meeting = by_meeting.fillna("")
+
+        buf=io.BytesIO()
+        with pd.ExcelWriter(buf,engine="openpyxl",date_format="YYYY-MM-DD") as xw:
+            excel_df_name.to_excel(xw,index=False,sheet_name="Jobs_by_Name")
+            excel_df_meeting.to_excel(xw,index=False,sheet_name="Jobs_by_MeetingDate")
+        buf.seek(0)
+
+        st.download_button("Download ACTIVE_Proxy_Jobs.xlsx",
+            data=buf.getvalue(),
+            file_name="ACTIVE_Proxy_Jobs.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True)
+
+        if HAS_FPDF:
+            pdf_cols = ["Job Number","Job Name","Broadridge MC","BRD S or P Job Number",
+                        "Record Date","Meeting Date","Adjournment Date"]
+        
+            pdf = FPDF(orientation="L", unit="mm", format="A4")
+            pdf.add_page()
+        
+            # Scale column widths to fit the full page width
+            page_width = pdf.w - 2 * pdf.l_margin
+            base_widths = [30, 60, 30, 40, 30, 30, 40]  # proportions
+            scale = page_width / sum(base_widths)
+            col_widths = [w * scale for w in base_widths]
+        
+            # Header
+            pdf.set_font("Arial", "B", 9)
+            for i, col in enumerate(pdf_cols):
+                pdf.cell(col_widths[i], 8, col, 1, 0, "C")
+            pdf.ln()
+        
+            # Rows (sorted by Meeting Date newest → oldest)
+            pdf.set_font("Arial", "", 8)
+            for _, row in by_meeting.fillna("").iterrows():
+                for i, col in enumerate(pdf_cols):
+                    val = str(row[col]) if row[col] else ""
+                    pdf.cell(col_widths[i], 6, val, 1, 0, "C")
+                pdf.ln()
+
+            pdf_buf = io.BytesIO(pdf.output(dest="S"))
+            st.download_button(
+                "Download ACTIVE_Proxy_Jobs.pdf",
+                data=pdf_buf.getvalue(),
+                file_name="ACTIVE_Proxy_Jobs.pdf",
+                mime="application/pdf",
+                use_container_width=True,
             )
 
-            # Replace NaT with blanks for export
-            excel_df_name = by_name.fillna("")
-            excel_df_meeting = by_meeting.fillna("")
-
-            buf=io.BytesIO()
-            with pd.ExcelWriter(buf,engine="openpyxl",date_format="YYYY-MM-DD") as xw:
-                excel_df_name.to_excel(xw,index=False,sheet_name="Jobs_by_Name")
-                excel_df_meeting.to_excel(xw,index=False,sheet_name="Jobs_by_MeetingDate")
-            buf.seek(0)
-
-            st.success(f"Built {len(out_df)} rows from '{WORKSPACE_NAME}' → '{SPACE_NAME}'.")
-            st.download_button("Download ACTIVE_Proxy_Jobs.xlsx",
-                data=buf.getvalue(),
-                file_name="ACTIVE_Proxy_Jobs.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True)
-
-            if HAS_FPDF:
-                pdf_cols = ["Job Number","Job Name","Broadridge MC","BRD S or P Job Number",
-                            "Record Date","Meeting Date","Adjournment Date"]
-            
-                pdf = FPDF(orientation="L", unit="mm", format="A4")
-                pdf.add_page()
-            
-                # Scale column widths to fit the full page width
-                page_width = pdf.w - 2 * pdf.l_margin
-                base_widths = [30, 60, 30, 40, 30, 30, 40]  # your original proportions
-                scale = page_width / sum(base_widths)
-                col_widths = [w * scale for w in base_widths]
-            
-                # Header
-                pdf.set_font("Arial", "B", 9)
-                for i, col in enumerate(pdf_cols):
-                    pdf.cell(col_widths[i], 8, col, 1, 0, "C")
-                pdf.ln()
-            
-                # Rows
-                # Rows (sorted by Meeting Date newest → oldest)
-                pdf.set_font("Arial", "", 8)
-                for _, row in by_meeting.fillna("").iterrows():
-                    for i, col in enumerate(pdf_cols):
-                        val = str(row[col]) if row[col] else ""
-                        pdf.cell(col_widths[i], 6, val, 1, 0, "C")
-                    pdf.ln()
-
-                pdf_buf = io.BytesIO(pdf.output(dest="S"))
-                st.download_button(
-                    "Download ACTIVE_Proxy_Jobs.pdf",
-                    data=pdf_buf.getvalue(),
-                    file_name="ACTIVE_Proxy_Jobs.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-
-            st.dataframe(out_df.head(50),use_container_width=True)
+        st.dataframe(out_df.head(50),use_container_width=True)
 
 except Exception as e:
     st.error(f"Unexpected error: {e}")
